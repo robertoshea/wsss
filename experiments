@@ -1,0 +1,1785 @@
+# WSSS window extraction and modelling
+
+# <editor-fold desc="">
+# </editor-fold>
+
+# <editor-fold desc="Import libraries">
+import numpy as np
+import pandas as pd
+import pydicom
+import rt_utils
+import os
+import random
+import cv2
+# </editor-fold>
+
+# <editor-fold desc="Set seed">
+random.seed(0)
+np.random.seed(0)
+# </editor-fold>
+
+# <editor-fold desc="Utility functions">
+def rec_listdir(dir):
+    paths = list()
+    for root, directories, filenames in os.walk(dir):
+        for filename in filenames:
+            paths.append(os.path.join(root, filename))
+    return paths
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+# </editor-fold>
+
+# <editor-fold desc="Image sampling parameters">
+window_size = 128
+half_window_size = window_size // 2
+n_sample = 16
+class_ratio = 1
+offset = window_size//8
+
+def extract_windows(img_arr, seg_arr):
+
+    # positive windows
+    pos_idx = np.array(np.where(seg_arr)).transpose()
+    n_sample_i = min(n_sample, len(pos_idx))
+    pos_idx = pos_idx[np.random.choice(np.arange(len(pos_idx)), size=n_sample_i)]
+    pos_idx[:, 1:] = pos_idx[:, 1:] + np.random.randint(low=-offset,
+                                                        high=offset,
+                                                        size=pos_idx[:, 1:].shape)
+
+    # random windows
+    n_random_sample = n_sample * class_ratio
+    random_idx = np.array([
+        np.random.choice(img_arr.shape[0], size=n_random_sample),
+        np.random.choice(img_arr.shape[1], size=n_random_sample),
+        np.random.choice(img_arr.shape[2], size=n_random_sample)
+    ]).transpose()
+    d1_limits = np.where(np.max(img_arr, axis=(0, 2)) > 0)[0]
+    d2_limits = np.where(np.max(img_arr, axis=(0, 1)) > 0)[0]
+    random_idx[:, 1] = np.clip(random_idx[:, 1], a_max=max(d1_limits)-150, a_min=min(d1_limits)+150)
+    random_idx[:, 2] = np.clip(random_idx[:, 2], a_max=max(d2_limits)-150, a_min=min(d2_limits)+150)
+    centre_idx = np.concatenate([pos_idx, random_idx])
+    centre_idx[:, 1:] = np.clip(centre_idx[:, 1:], a_max=511 - half_window_size, a_min=half_window_size)
+
+    img_windows = []
+    seg_windows = []
+    for centre_i in range(len(centre_idx)):
+        centre = centre_idx[centre_i, :]
+        img_window_i = img_arr[
+                       centre[0],
+                       (centre[1] - half_window_size):(centre[1] + half_window_size),
+                       (centre[2] - half_window_size):(centre[2] + half_window_size)
+                       ]
+        img_windows.append(img_window_i)
+
+        seg_window_i = seg_arr[
+                       centre[0],
+                       (centre[1] - half_window_size):(centre[1] + half_window_size),
+                       (centre[2] - half_window_size):(centre[2] + half_window_size)
+                       ]
+        seg_windows.append(seg_window_i)
+
+    img_windows = np.stack(img_windows).astype('float32')
+    seg_windows = np.stack(seg_windows).astype('uint8')
+
+    return img_windows, seg_windows
+
+# </editor-fold>
+
+# <editor-fold desc="Set base directory">
+base_dir = r'C:\Users\ro20\Documents\Datasets'
+# </editor-fold>
+
+# Lung1 (download from https://wiki.cancerimagingarchive.net/display/Public/NSCLC-Radiomics)
+
+# <editor-fold desc="File management">
+main_dir = base_dir + r'\Lung1'
+output_dir = main_dir + r'\NPY'
+img_output_dir = output_dir + r'\img_windows_' + str(window_size)
+if not os.path.exists(img_output_dir):
+    os.mkdir(img_output_dir)
+seg_output_dir = output_dir + r'\seg_windows_' + str(window_size)
+if not os.path.exists(seg_output_dir):
+    os.mkdir(seg_output_dir)
+
+all_metadata = pd.read_csv(main_dir + '/metadata.csv')
+img_df = all_metadata.loc[all_metadata.Modality == 'CT', :].reset_index()
+img_df.rename(columns={'File Location': 'img_dir'}, inplace=True)
+seg_df = all_metadata.loc[all_metadata.Modality == 'RTSTRUCT', ['Study UID', 'File Location']]
+seg_df.rename(columns={'File Location': 'seg_dir'}, inplace=True)
+img_metadata = pd.merge(img_df, seg_df, on='Study UID')
+
+clinical_metadata = pd.read_csv(main_dir + '/clinical_data.csv')
+clinical_metadata.rename(columns={'PatientID': 'Subject ID'}, inplace=True)
+img_metadata = pd.merge(img_metadata, clinical_metadata, on='Subject ID')
+
+# </editor-fold>
+
+# <editor-fold desc="Image Saving Loop">
+for obs_i in range(len(img_metadata)):
+
+    print(obs_i)
+    patient_id = img_metadata['Subject ID'][obs_i]
+    date = img_metadata['Study Date'][obs_i]
+    img_dir = main_dir + img_metadata.img_dir[obs_i][1:]
+    seg_dir = main_dir + img_metadata.seg_dir[obs_i][1:]
+    seg_file = rec_listdir(seg_dir)[0]
+    try:
+        rtstruct_i = rt_utils.RTStructBuilder.create_from(
+            dicom_series_path=img_dir,
+            rt_struct_path=seg_file
+        )
+    except:
+        continue
+    img_arr = []
+    for dcm_i in rtstruct_i.series_data:
+        arr_i = dcm_i.pixel_array
+        arr_i = pydicom.pixel_data_handlers.util.apply_modality_lut(arr_i, dcm_i)
+        img_arr.append(arr_i)
+    img_arr = np.stack([img_arr])
+    img_arr = np.squeeze(img_arr)
+
+    roi_names = rtstruct_i.get_roi_names()
+    roi_names_lower = [i.lower() for i in roi_names]
+    if ('gtv-1' in roi_names):
+        roi_name = 'gtv-1'
+    elif all(i in ''.join(roi_names_lower) for i in ['gtv', '1']):
+        roi_name = [i for i in roi_names if ('gtv' and '1') in i.lower()][0]
+    elif all(i in ''.join(roi_names_lower) for i in ['gtv', 'pre']):
+        roi_name = [i for i in roi_names if ('gtv' and 'pre') in i.lower()][0]
+    else:
+        continue
+    seg_arr = rtstruct_i.get_roi_mask_by_name(roi_name) * 1
+    seg_arr = np.moveaxis(seg_arr,
+                          source=-1,
+                          destination=0)
+
+    img_windows, seg_windows = extract_windows(img_arr, seg_arr)
+    np.save(arr=img_windows,
+            file=img_output_dir + '\\' + patient_id + '_' + date + '.npy')
+    np.save(arr=seg_windows,
+            file=seg_output_dir + '\\' + patient_id + '_' + date + '.npy')
+
+# </editor-fold>
+
+# Lung2 (download from https://wiki.cancerimagingarchive.net/display/Public/NSCLC+Radiogenomics)
+
+# <editor-fold desc="File Management">
+main_dir = base_dir + r'\Lung2'
+output_dir = main_dir + r'\NPY'
+img_output_dir = output_dir + r'\img_windows_' + str(window_size)
+if not os.path.exists(img_output_dir):
+    os.mkdir(img_output_dir)
+seg_output_dir = output_dir + r'\seg_windows_' + str(window_size)
+if not os.path.exists(seg_output_dir):
+    os.mkdir(seg_output_dir)
+
+all_metadata = main_dir + '\metadata.csv'
+all_metadata = pd.read_csv(all_metadata)
+all_metadata = all_metadata[['Subject ID', 'Study UID', 'Study Date', 'Modality', 'File Location']]
+all_metadata = all_metadata.loc[all_metadata['Modality'].isin(('CT', 'SEG')), :]
+all_metadata['Study Date'] = all_metadata['Study Date'].str.replace('/', '-')
+
+img_metadata = all_metadata.loc[all_metadata['Modality'] == 'CT', :]
+img_metadata = img_metadata.drop(labels='Modality', axis=1)
+img_metadata.rename(mapper={'File Location': 'img_dir'}, axis=1, inplace=True)
+seg_metadata = all_metadata.loc[all_metadata['Modality'] == 'SEG', :]
+seg_metadata = seg_metadata.drop(labels='Modality', axis=1)
+seg_metadata.rename(mapper={'File Location': 'seg_dir'}, axis=1, inplace=True)
+img_metadata = img_metadata.merge(seg_metadata, on=['Subject ID', 'Study UID', 'Study Date'])
+
+# </editor-fold>
+
+# <editor-fold desc="Image Saving Loop">
+for obs_i in range(len(img_metadata)):
+
+    print(obs_i)
+    patient_id = img_metadata['Subject ID'][obs_i]
+    date = img_metadata['Study Date'][obs_i]
+    img_dir = main_dir + img_metadata.img_dir[obs_i][1:]
+    img_files = rec_listdir(img_dir)
+    img_dcms = [pydicom.dcmread(i) for i in img_files]
+    img_uids = [i[('0008', '0018')].value for i in img_dcms]
+    img_slice_df = pd.DataFrame({'uid': img_uids,
+                                 'img_idx': range(len(img_uids))
+                                 })
+
+    seg_dir = main_dir + img_metadata.seg_dir[obs_i][1:]
+    seg_file = rec_listdir(seg_dir)[0]
+    seg_dcm = pydicom.dcmread(seg_file)
+    seg_uids = [i[('0008', '1155')].value for i in
+                seg_dcm.ReferencedSeriesSequence[0].ReferencedInstanceSequence]
+    seg_slice_df = pd.DataFrame({'uid': seg_uids,
+                                 'seg_idx': range(len(seg_uids))
+                                 })
+    slice_df = pd.merge(img_slice_df, seg_slice_df)
+    if len(slice_df) == 0:
+        continue
+
+    seg_arr = seg_dcm.pixel_array[slice_df.seg_idx]
+    img_arr = []
+    for slice_i in slice_df.img_idx:
+        dcm_i = img_dcms[slice_i]
+        arr_i = dcm_i.pixel_array
+        arr_i = pydicom.pixel_data_handlers.util.apply_modality_lut(arr_i, dcm_i)
+        img_arr.append(arr_i)
+    img_arr = np.stack([img_arr])
+    img_arr = np.squeeze(img_arr)
+
+    img_windows, seg_windows = extract_windows(img_arr, seg_arr)
+    np.save(arr=img_windows,
+            file=img_output_dir + '\\' + patient_id + '_' + date + '.npy')
+    np.save(arr=seg_windows,
+            file=seg_output_dir + '\\' + patient_id + '_' + date + '.npy')
+# </editor-fold>
+
+# Modelling
+
+# <editor-fold desc="Import Libraries">
+import numpy as np
+import pandas as pd
+import os
+import matplotlib.pyplot as plt
+import tensorflow as tf
+import keras_unet
+import sklearn.metrics
+import random
+import tf_explain
+import cv2
+from scipy import stats
+# </editor-fold>
+
+# <editor-fold desc="Utility Functions">
+def rec_listdir(dir):
+    paths = list()
+    for root, directories, filenames in os.walk(dir):
+        for filename in filenames:
+            paths.append(os.path.join(root, filename))
+    return paths
+
+
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+def generate_img_df(main_dir):
+    # images
+    img_dir = main_dir + r'\NPY\img_windows_' + str(window_size)
+    img_files = rec_listdir(img_dir)
+    img_df = pd.DataFrame({
+        'patient_id': [os.path.basename(i).split(sep='_')[0] for i in img_files],
+        'img_file': img_files
+    })
+
+    # segmentations
+    seg_dir = main_dir + r'\NPY\seg_windows_' + str(window_size)
+    seg_files = rec_listdir(seg_dir)
+    seg_df = pd.DataFrame({
+        'patient_id': [os.path.basename(i).split(sep='_')[0] for i in seg_files],
+        'seg_file': seg_files
+    })
+
+    # align images with segmentations
+    img_df = pd.merge(img_df, seg_df)
+
+    return img_df
+
+
+def load_data(img_df):
+
+    # images
+    X_i = np.concatenate([np.load(i)
+                          for i in img_df.img_file], axis=0)
+    X_i = np.expand_dims(X_i, axis=-1)
+    X_i = np.clip(X_i, a_min=-1024, a_max=150)
+    X_i = (X_i + 1024)/1500
+
+    # voxel-level labels
+    Y_i = np.concatenate([np.load(i)
+                          for i in img_df.seg_file], axis=0)
+    Y_i = np.expand_dims(Y_i, axis=-1).astype(float)
+
+    # image-level labels
+    Z_i = Y_i.any(axis=(1, 2, 3)).astype(float)
+
+    return X_i, Y_i, Z_i
+
+def np_dice(y_true, y_pred):
+    num = 2. * np.sum(y_true * y_pred)
+    denom = np.sum(y_true) + np.sum(y_pred)
+    return num / denom
+
+# </editor-fold>
+
+# <editor-fold desc="File Management">
+train_val_dir = 'C:/Users/ro20/Documents/Datasets/Lung1'
+train_val_df = generate_img_df(train_val_dir)
+
+train_val_patients = train_val_df.patient_id.unique()
+train_patients = np.random.choice(train_val_patients,
+                                  size=round(len(train_val_patients) * 0.8),
+                                  replace=False)
+val_patients = np.setdiff1d(train_val_patients,
+                            train_patients)
+train_df = train_val_df.loc[train_val_df.patient_id.isin(train_patients), :].reset_index()
+val_df = train_val_df.loc[train_val_df.patient_id.isin(val_patients), :].reset_index()
+
+test_dir = 'C:/Users/ro20/Documents/Datasets/Lung2'
+test_df = generate_img_df(test_dir)
+
+# </editor-fold>
+
+# <editor-fold desc="Define Generators">
+BATCH_SIZE = 100
+AUG_NOISE = 0.001
+AUG_ROTATE = True
+AUG_VFLIP = True
+AUG_HFLIP = True
+img_size = window_size
+
+class WeakDataGen(tf.keras.utils.Sequence):
+    """Loads batches of dcm files as images for autoencoder"""
+
+    def __init__(self,
+                 x,
+                 z,
+                 augment,
+                 batch_size,
+                 shuffle):
+        """Initialization"""
+        self.x = x
+        self.z = z
+        self.augment = augment
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.on_epoch_begin()
+
+    def __len__(self):
+        """Denotes the number of batches per epoch"""
+        return len(self.x) // self.batch_size
+
+    def __getitem__(self, idx):
+        """Generate one batch of data"""
+        # Generate indexes of the batch
+
+        batch_idx = self.all_idx[idx * self.batch_size:(idx + 1) * self.batch_size]
+
+        # Generate data
+        batch_x, batch_z = self.__data_generation(batch_idx=batch_idx)
+
+        return batch_x, batch_z
+
+    def on_epoch_begin(self):
+        """Updates indexes after each epoch"""
+        self.all_idx = np.arange(len(self.x))
+        if self.shuffle:
+            np.random.shuffle(self.all_idx)
+
+    def __data_generation(self, batch_idx):
+        # get batch of images
+        x = self.x[batch_idx, :, :, :]
+        z = self.z[batch_idx]
+
+        if self.augment:
+
+            n_aug = len(batch_idx) // 2
+            idx = list(range(len(batch_idx)))
+
+            # horizontal flip
+            if AUG_HFLIP:
+                aug_idx = np.random.choice(idx,
+                                           replace=False,
+                                           size=n_aug)
+                x[aug_idx] = np.flip(x[aug_idx], axis=2)
+
+            # vertical flip
+            if AUG_VFLIP:
+                aug_idx = np.random.choice(idx,
+                                           replace=False,
+                                           size=n_aug)
+                x[aug_idx] = np.flip(x[aug_idx], axis=1)
+
+            # rotations
+            if AUG_ROTATE:
+                for rotation_i in range(3):
+                    aug_idx = np.random.choice(idx,
+                                               replace=False,
+                                               size=n_aug)
+                    x[aug_idx] = np.rot90(x[aug_idx], axes=(1, 2))
+
+            # add noise
+            if AUG_NOISE > 0:
+                aug_idx = np.random.choice(idx,
+                                           replace=False,
+                                           size=n_aug)
+                x[aug_idx] += np.random.normal(size=(n_aug,) + x.shape[1:], scale=AUG_NOISE)
+
+        return x, z
+
+class FullDataGen(tf.keras.utils.Sequence):
+    """Loads batches of dcm files as images for autoencoder"""
+
+    def __init__(self,
+                 x,
+                 y,
+                 augment,
+                 batch_size,
+                 shuffle):
+        """Initialization"""
+        self.x = x
+        self.y = y
+        self.augment = augment
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.on_epoch_begin()
+
+    def __len__(self):
+        """Denotes the number of batches per epoch"""
+        return len(self.x) // self.batch_size
+
+    def __getitem__(self, idx):
+        """Generate one batch of data"""
+        # Generate indexes of the batch
+
+        batch_idx = self.all_idx[idx * self.batch_size:(idx + 1) * self.batch_size]
+
+        # Generate data
+        batch_x, batch_y = self.__data_generation(batch_idx=batch_idx)
+
+        return batch_x, batch_y
+
+    def on_epoch_begin(self):
+        """Updates indexes after each epoch"""
+        self.all_idx = np.arange(len(self.x))
+        if self.shuffle:
+            np.random.shuffle(self.all_idx)
+
+    def __data_generation(self, batch_idx):
+        # get batch of images
+        x = self.x[batch_idx, :, :, :]
+        y = self.y[batch_idx, :, :, :]
+
+        if self.augment:
+
+            n_aug = len(batch_idx) // 2
+            idx = list(range(len(batch_idx)))
+
+            # horizontal flip
+            if AUG_HFLIP:
+                aug_idx = np.random.choice(idx,
+                                           replace=False,
+                                           size=n_aug)
+                x[aug_idx] = np.flip(x[aug_idx], axis=2)
+                y[aug_idx] = np.flip(y[aug_idx], axis=2)
+
+            # vertical flip
+            if AUG_VFLIP:
+                aug_idx = np.random.choice(idx,
+                                           replace=False,
+                                           size=n_aug)
+                x[aug_idx] = np.flip(x[aug_idx], axis=1)
+                y[aug_idx] = np.flip(y[aug_idx], axis=1)
+
+            # rotations
+            if AUG_ROTATE:
+                for rotation_i in range(3):
+                    aug_idx = np.random.choice(idx,
+                                               replace=False,
+                                               size=n_aug)
+                    x[aug_idx] = np.rot90(x[aug_idx], axes=(1, 2))
+                    y[aug_idx] = np.rot90(y[aug_idx], axes=(1, 2))
+
+            # add noise
+            if AUG_NOISE > 0:
+                aug_idx = np.random.choice(idx,
+                                           replace=False,
+                                           size=n_aug)
+                x[aug_idx] += np.random.normal(size=(n_aug,) + x.shape[1:], scale=AUG_NOISE)
+
+        return x, y
+# </editor-fold>
+
+# <editor-fold desc="Load Training Generators">
+X_train, _, Z_train = load_data(train_df)
+X_val, _, Z_val = load_data(val_df)
+
+ws_train_datagen = WeakDataGen(x=X_train,
+                               z=Z_train,
+                               augment=True,
+                               batch_size=BATCH_SIZE,
+                               shuffle=True)
+
+ws_val_datagen = WeakDataGen(x=X_val,
+                             z=Z_val,
+                             augment=False,
+                             batch_size=BATCH_SIZE,
+                             shuffle=True)
+
+# </editor-fold>
+
+# <editor-fold desc="Loss Functions, Metrics and Callbacks">
+
+# loss functions
+def bce_loss(y_true, y_pred):
+    bce = tf.keras.losses.binary_crossentropy(y_true=y_true,
+                                              y_pred=y_pred,
+                                              from_logits=True)
+    return bce
+
+custom_objects = {
+    'bce_loss': bce_loss
+}
+
+# callbacks
+early_stopping_callback = tf.keras.callbacks.EarlyStopping(patience=5)
+model_dir = r'models\20_05_22'
+if not os.path.exists(model_dir):
+    os.mkdir(model_dir)
+ws_model_dir = model_dir + r'\ws_model'
+if not os.path.exists(ws_model_dir):
+    os.mkdir(ws_model_dir)
+standard_model_dir = model_dir + r'\standard_model'
+if not os.path.exists(standard_model_dir):
+    os.mkdir(standard_model_dir)
+
+ws_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(save_best_only=True,
+                                                            filepath=ws_model_dir)
+standard_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(save_best_only=True,
+                                                                  filepath=standard_model_dir)
+
+# </editor-fold>
+
+# <editor-fold desc="Define Models">
+
+# weakly supervised unet
+def define_ws_model(n_filters=8,
+                    n_layers=4,
+                    dropout_rate=0.25):
+    fcn_model = keras_unet.models.custom_unet(input_shape=(img_size, img_size, 1),
+                                              activation='relu',
+                                              use_batch_norm=True,
+                                              upsample_mode='deconv',
+                                              dropout=dropout_rate,
+                                              dropout_type='spatial',
+                                              filters=n_filters,
+                                              num_layers=n_layers,
+                                              output_activation='linear'
+                                              )
+    fcn_model.layers[-1]._name = 'voxel_level_output'
+    image_level_output = tf.keras.layers.GlobalMaxPool2D()(fcn_model.output)
+    ws_model = tf.keras.models.Model(fcn_model.input, image_level_output)
+    ws_model.compile(optimizer='Adam',
+                     loss=bce_loss)
+    return ws_model
+
+#standard model
+def define_standard_model(n_filters=8,
+             n_layers=4,
+             dropout_rate=0.25):
+    inputs = tf.keras.layers.Input(shape=(img_size, img_size, 1))
+    x = inputs
+
+    for layer_i in range(n_layers):
+        x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** layer_i,
+                                   kernel_size=3,
+                                   activation='relu',
+                                   kernel_initializer="he_normal",
+                                   padding='same',
+                                   )(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.SpatialDropout2D(rate=dropout_rate)(x)
+        x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** layer_i,
+                                   kernel_size=3,
+                                   activation='relu',
+                                   kernel_initializer="he_normal",
+                                   padding='same',
+                                   )(x)
+        x = tf.keras.layers.MaxPooling2D(pool_size=2)(x)
+
+    x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** n_layers,
+                               kernel_size=3,
+                               activation='relu',
+                               kernel_initializer="he_normal",
+                               padding='same',
+                               )(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.SpatialDropout2D(rate=dropout_rate)(x)
+    x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** n_layers,
+                               kernel_size=3,
+                               activation='relu',
+                               kernel_initializer="he_normal",
+                               padding='same',
+                               )(x)
+
+    x = tf.keras.layers.Flatten()(x)
+    x = tf.keras.layers.Dense(units=128,
+                              activation='relu',
+                              kernel_initializer="he_normal")(x)
+    outputs = tf.keras.layers.Dense(units=1,
+                                    activation='linear')(x)
+
+    model = tf.keras.models.Model(inputs, outputs)
+    model.compile(optimizer='Adam',
+                  loss=bce_loss,
+                  )
+    return model
+
+# </editor-fold>
+
+# <editor-fold desc="Explainability Methods">
+class GradCAM:
+
+    """
+    Perform Grad CAM algorithm for a given input
+    Paper: [Grad-CAM: Visual Explanations from Deep Networks
+            via Gradient-based Localization](https://arxiv.org/abs/1610.02391)
+    """
+
+    def explain(
+        self,
+        validation_data,
+        model,
+        class_index,
+        layer_name=None,
+        use_guided_grads=True
+    ):
+        """
+        Compute GradCAM for a specific class index.
+        Args:
+            validation_data (Tuple[np.ndarray, Optional[np.ndarray]]): Validation data
+                to perform the method on. Tuple containing (x, y).
+            model (tf.keras.Model): tf.keras model to inspect
+            class_index (int): Index of targeted class
+            layer_name (str): Targeted layer for GradCAM. If no layer is provided, it is
+                automatically infered from the model architecture.
+            colormap (int): OpenCV Colormap to use for heatmap visualization
+            image_weight (float): An optional `float` value in range [0,1] indicating the weight of
+                the input image to be overlaying the calculated attribution maps. Defaults to `0.7`.
+            use_guided_grads (boolean): Whether to use guided grads or raw gradients
+        Returns:
+            numpy.ndarray: Grid of all the GradCAM
+        """
+        images, _ = validation_data
+
+        if layer_name is None:
+            layer_name = self.infer_grad_cam_target_layer(model)
+
+        outputs, grads = GradCAM.get_gradients_and_filters(
+            model, images, layer_name, class_index, use_guided_grads
+        )
+
+        cams = GradCAM.generate_ponderated_output(outputs, grads)
+
+        if layer_name is None:
+            layer_name = self.infer_grad_cam_target_layer(model)
+
+        outputs, grads = GradCAM.get_gradients_and_filters(
+            model, images, layer_name, class_index, use_guided_grads
+        )
+
+        cams = GradCAM.generate_ponderated_output(outputs, grads)
+        arr_out = np.array(cams)
+
+        rescale = images.shape[1] // arr_out.shape[1]
+        if rescale > 1:
+            arr_out = arr_out.repeat(rescale, axis=1).repeat(rescale, axis=2)
+
+        return arr_out
+
+    @staticmethod
+    def infer_grad_cam_target_layer(model):
+        """
+        Search for the last convolutional layer to perform Grad CAM, as stated
+        in the original paper.
+        Args:
+            model (tf.keras.Model): tf.keras model to inspect
+        Returns:
+            str: Name of the target layer
+        """
+        for layer in reversed(model.layers):
+            # Select closest 4D layer to the end of the network.
+            if len(layer.output_shape) == 4:
+                return layer.name
+
+        raise ValueError(
+            "Model does not seem to contain 4D layer. Grad CAM cannot be applied."
+        )
+
+    @staticmethod
+    def get_gradients_and_filters(
+        model, images, layer_name, class_index, use_guided_grads
+    ):
+        """
+        Generate guided gradients and convolutional outputs with an inference.
+        Args:
+            model (tf.keras.Model): tf.keras model to inspect
+            images (numpy.ndarray): 4D-Tensor with shape (batch_size, H, W, 3)
+            layer_name (str): Targeted layer for GradCAM
+            class_index (int): Index of targeted class
+            use_guided_grads (boolean): Whether to use guided grads or raw gradients
+        Returns:
+            Tuple[tf.Tensor, tf.Tensor]: (Target layer outputs, Guided gradients)
+        """
+        grad_model = tf.keras.models.Model(
+            [model.inputs], [model.get_layer(layer_name).output, model.output]
+        )
+
+        with tf.GradientTape() as tape:
+            inputs = tf.cast(images, tf.float32)
+            tape.watch(inputs)
+            conv_outputs, predictions = grad_model(inputs)
+            loss = predictions[:, class_index]
+
+        grads = tape.gradient(loss, conv_outputs)
+
+        if use_guided_grads:
+            grads = (
+                tf.cast(conv_outputs > 0, "float32")
+                * tf.cast(grads > 0, "float32")
+                * grads
+            )
+
+        return conv_outputs, grads
+
+    @staticmethod
+    def generate_ponderated_output(outputs, grads):
+        """
+        Apply Grad CAM algorithm scheme.
+        Inputs are the convolutional outputs (shape WxHxN) and gradients (shape WxHxN).
+        From there:
+            - we compute the spatial average of the gradients
+            - we build a ponderated sum of the convolutional outputs based on those averaged weights
+        Args:
+            output (tf.Tensor): Target layer outputs, with shape (batch_size, Hl, Wl, Nf),
+                where Hl and Wl are the target layer output height and width, and Nf the
+                number of filters.
+            grads (tf.Tensor): Guided gradients with shape (batch_size, Hl, Wl, Nf)
+        Returns:
+            List[tf.Tensor]: List of ponderated output of shape (batch_size, Hl, Wl, 1)
+        """
+
+        maps = [
+            GradCAM.ponderate_output(output, grad)
+            for output, grad in zip(outputs, grads)
+        ]
+
+        return maps
+
+    @staticmethod
+    def ponderate_output(output, grad):
+        """
+        Perform the ponderation of filters output with respect to average of gradients values.
+        Args:
+            output (tf.Tensor): Target layer outputs, with shape (Hl, Wl, Nf),
+                where Hl and Wl are the target layer output height and width, and Nf the
+                number of filters.
+            grads (tf.Tensor): Guided gradients with shape (Hl, Wl, Nf)
+        Returns:
+            tf.Tensor: Ponderated output of shape (Hl, Wl, 1)
+        """
+        weights = tf.reduce_mean(grad, axis=(0, 1))
+
+        # Perform ponderated sum : w_i * output[:, :, i]
+        cam = tf.reduce_sum(tf.multiply(weights, output), axis=-1)
+
+        return cam
+
+class IntegratedGradients:
+
+    """
+    Perform Integrated Gradients algorithm for a given input
+    Paper: [Axiomatic Attribution for Deep Networks](https://arxiv.org/pdf/1703.01365.pdf)
+    """
+
+    def explain(self, validation_data, model, class_index, n_steps=10):
+        """
+        Compute Integrated Gradients for a specific class index
+        Args:
+            validation_data (Tuple[np.ndarray, Optional[np.ndarray]]): Validation data
+                to perform the method on. Tuple containing (x, y).
+            model (tf.keras.Model): tf.keras model to inspect
+            class_index (int): Index of targeted class
+            n_steps (int): Number of steps in the path
+        Returns:
+            np.ndarray: Grid of all the integrated gradients
+        """
+        images, _ = validation_data
+
+        interpolated_images = IntegratedGradients.generate_interpolations(
+            np.array(images), n_steps
+        )
+
+        integrated_gradients = IntegratedGradients.get_integrated_gradients(
+            interpolated_images, model, class_index, n_steps
+        )
+
+        grayscale_integrated_gradients = tf_explain.utils.image.transform_to_normalized_grayscale(
+            tf.abs(integrated_gradients)
+        ).numpy()
+
+        arr_out = np.array(grayscale_integrated_gradients)
+        return arr_out
+
+    @staticmethod
+    @tf.function
+    def get_integrated_gradients(interpolated_images, model, class_index, n_steps):
+        """
+        Perform backpropagation to compute integrated gradients.
+        Args:
+            interpolated_images (numpy.ndarray): 4D-Tensor of shape (N * n_steps, H, W, 3)
+            model (tf.keras.Model): tf.keras model to inspect
+            class_index (int): Index of targeted class
+            n_steps (int): Number of steps in the path
+        Returns:
+            tf.Tensor: 4D-Tensor of shape (N, H, W, 3) with integrated gradients
+        """
+        with tf.GradientTape() as tape:
+            inputs = tf.cast(interpolated_images, tf.float32)
+            tape.watch(inputs)
+            predictions = model(inputs)
+            loss = predictions[:, class_index]
+
+        grads = tape.gradient(loss, inputs)
+        grads_per_image = tf.reshape(grads, (-1, n_steps, *grads.shape[1:]))
+
+        integrated_gradients = tf.reduce_mean(grads_per_image, axis=1)
+
+        return integrated_gradients
+
+    @staticmethod
+    def generate_interpolations(images, n_steps):
+        """
+        Generate interpolation paths for batch of images.
+        Args:
+            images (numpy.ndarray): 4D-Tensor of images with shape (N, H, W, 3)
+            n_steps (int): Number of steps in the path
+        Returns:
+            numpy.ndarray: Interpolation paths for each image with shape (N * n_steps, H, W, 3)
+        """
+        baseline = np.zeros(images.shape[1:])
+
+        return np.concatenate(
+            [
+                IntegratedGradients.generate_linear_path(baseline, image, n_steps)
+                for image in images
+            ]
+        )
+
+    @staticmethod
+    def generate_linear_path(baseline, target, n_steps):
+        """
+        Generate the interpolation path between the baseline image and the target image.
+        Args:
+            baseline (numpy.ndarray): Reference image
+            target (numpy.ndarray): Target image
+            n_steps (int): Number of steps in the path
+        Returns:
+            List(np.ndarray): List of images for each step
+        """
+        return [
+            baseline + (target - baseline) * index / (n_steps - 1)
+            for index in range(n_steps)
+        ]
+
+class OcclusionSensitivity:
+
+    """
+    Perform Occlusion Sensitivity for a given input
+    """
+
+    def __init__(self, batch_size=None):
+        self.batch_size = batch_size
+
+    def explain(
+        self,
+        validation_data,
+        model,
+        class_index,
+        patch_size,
+    ):
+        """
+        Compute Occlusion Sensitivity maps for a specific class index.
+        Args:
+            validation_data (Tuple[np.ndarray, Optional[np.ndarray]]): Validation data
+                to perform the method on. Tuple containing (x, y).
+            model (tf.keras.Model): tf.keras model to inspect
+            class_index (int): Index of targeted class
+            patch_size (int): Size of patch to apply on the image
+            colormap (int): OpenCV Colormap to use for heatmap visualization
+        Returns:
+            np.ndarray: Grid of all the sensitivity maps with shape (batch_size, H, W, 3)
+        """
+        images, _ = validation_data
+        sensitivity_maps = np.array(
+            [
+                self.get_sensitivity_map(model, image, class_index, patch_size)
+                for image in images
+            ]
+        )
+
+        return np.array(sensitivity_maps)
+
+    def get_sensitivity_map(self, model, image, class_index, patch_size):
+        """
+        Compute sensitivity map on a given image for a specific class index.
+        Args:
+            model (tf.keras.Model): tf.keras model to inspect
+            image:
+            class_index (int): Index of targeted class
+            patch_size (int): Size of patch to apply on the image
+        Returns:
+            np.ndarray: Sensitivity map with shape (H, W, 3)
+        """
+        sensitivity_map = np.zeros(
+            (
+                np.ceil(image.shape[0] / patch_size).astype(int),
+                np.ceil(image.shape[1] / patch_size).astype(int),
+            )
+        )
+
+        patches = [
+            tf_explain.utils.image.apply_grey_patch(image, top_left_x, top_left_y, patch_size)
+            for index_x, top_left_x in enumerate(range(0, image.shape[0], patch_size))
+            for index_y, top_left_y in enumerate(range(0, image.shape[1], patch_size))
+        ]
+
+        coordinates = [
+            (index_y, index_x)
+            for index_x in range(
+                sensitivity_map.shape[1]  # pylint: disable=unsubscriptable-object
+            )
+            for index_y in range(
+                sensitivity_map.shape[0]  # pylint: disable=unsubscriptable-object
+            )
+        ]
+
+        predictions = model.predict(np.array(patches), batch_size=self.batch_size)
+        target_class_predictions = [
+            prediction[class_index] for prediction in predictions
+        ]
+
+        for (index_y, index_x), confidence in zip(
+            coordinates, target_class_predictions
+        ):
+            sensitivity_map[index_y, index_x] = 1 - confidence
+
+        sensitivity_map = cv2.resize(sensitivity_map, image.shape[0:2], interpolation=cv2.INTER_NEAREST)
+
+        return sensitivity_map
+
+
+grad_cam = GradCAM()
+integrated_gradients = IntegratedGradients()
+occlusion_sensitivity = OcclusionSensitivity()
+# </editor-fold>
+
+# <editor-fold desc="Fit Models and Save">
+tf.keras.backend.clear_session()
+
+# weakly supervised unet
+random.seed(0)
+np.random.seed(0)
+ws_model = define_ws_model()
+ws_history = ws_model.fit(x=ws_train_datagen,
+                          validation_data=ws_val_datagen,
+                          epochs=100,
+                          callbacks=[early_stopping_callback,
+                                     ws_checkpoint_callback]
+                          )
+
+# standard model
+standard_model = define_standard_model()
+standard_history = standard_model.fit(x=ws_train_datagen,
+                                      validation_data=ws_val_datagen,
+                                      epochs=100,
+                                      callbacks=[early_stopping_callback,
+                                                 standard_checkpoint_callback]
+                                      )
+# </editor-fold>
+
+# <editor-fold desc="Load Models">
+ws_model = tf.keras.models.load_model(ws_model_dir, custom_objects=custom_objects)
+ws_model_voxel_level = tf.keras.models.Model(ws_model.inputs,
+                                             ws_model.get_layer('voxel_level_output').output)
+standard_model = tf.keras.models.load_model(standard_model_dir, custom_objects=custom_objects)
+# </editor-fold>
+
+# <editor-fold desc="Load Testing Generators">
+
+# unload training data
+del X_train, Z_train, X_val, Z_val
+del ws_train_datagen, ws_val_datagen
+
+random.seed(0)
+np.random.seed(0)
+X_test, Y_test, Z_test = load_data(test_df)
+ws_test_datagen = WeakDataGen(x=X_test,
+                              z=Z_test,
+                              augment=False,
+                              batch_size=25,
+                              shuffle=True)
+fs_test_datagen = FullDataGen(x=X_test,
+                              y=Y_test,
+                              augment=False,
+                              batch_size=25,
+                              shuffle=True)
+
+# </editor-fold>
+
+# <editor-fold desc="Performance evaluation functions">
+
+# image-level
+def compute_zhats(x):
+    zhat_ws_i = sigmoid(ws_model.predict(x))
+    zhat_standard_i = sigmoid(standard_model.predict(x))
+
+    zhats_i = {
+        "WSUnet": zhat_ws_i,
+        "SCNN": zhat_standard_i
+    }
+
+    return zhats_i
+
+# voxel-level
+gc_layer_idx = [19, 24]
+gc_layer_names = [standard_model.layers[i].name for i in gc_layer_idx]
+
+def compute_yhats(x):
+    yhat_ws = sigmoid(np.squeeze(ws_model_voxel_level.predict(x)))
+    yhat_gc_16x16x64 = grad_cam.explain([x, _], model=standard_model, class_index=0, layer_name=gc_layer_names[0])
+    yhat_gc_8x8x128 = grad_cam.explain([x, _], model=standard_model, class_index=0, layer_name=gc_layer_names[1])
+    yhat_ig = integrated_gradients.explain([x, _], model=standard_model, class_index=0)
+    yhat_os = occlusion_sensitivity.explain([x, _], model=standard_model, class_index=0, patch_size=10)
+
+    yhats_i = {
+        'WSUnet': yhat_ws,
+        'GradCAM (16,16,64)': yhat_gc_16x16x64,
+        'GradCAM (8,8,128)': yhat_gc_8x8x128,
+        'Integrated Gradients': yhat_ig,
+        'Occlusion Sensitivity': yhat_os
+    }
+
+    return yhats_i
+# </editor-fold>
+
+# <editor-fold desc="Evaluate Performance">
+
+il_batch_performance = []
+vl_batch_performance = []
+batch_i = 0
+for x_i, y_i in fs_test_datagen:
+
+    print(batch_i)
+    batch_i += 1
+
+    # image-level performance
+    z_i = y_i.max(axis=(1,2,3)).astype(int)
+    zhats_i = compute_zhats(x_i)
+    for method_i in zhats_i.keys():
+        zhat_i = zhats_i.get(method_i)
+        zhat_i_bin = (zhat_i >= 0.5).astype(int)
+        scores_i = {
+            'Method': method_i,
+            'Accuracy': sklearn.metrics.accuracy_score(y_true=z_i,
+                                                       y_pred=zhat_i_bin),
+            'Sensitivity': sklearn.metrics.recall_score(y_true=z_i,
+                                                        y_pred=zhat_i_bin),
+            'Specificity': sklearn.metrics.recall_score(y_true=z_i,
+                                                        y_pred=zhat_i_bin,
+                                                        pos_label=0),
+            'AUC': sklearn.metrics.roc_auc_score(y_true=z_i,
+                                                 y_score=zhat_i),
+        }
+        il_batch_performance.append(scores_i)
+
+    #voxel level performance
+    y_i = y_i.flatten()
+    yhats_i = compute_yhats(x_i)
+    for method_i in yhats_i.keys():
+        yhat_i = yhats_i.get(method_i).flatten()
+        yhat_i_bin = (yhat_i >= 0.5).astype(int)
+
+        if method_i == "WSUnet":
+            precision_i = sklearn.metrics.precision_score(y_true=y_i,
+                                                         y_pred=yhat_i_bin),
+            recall_i = sklearn.metrics.recall_score(y_true=y_i,
+                                                   y_pred=yhat_i_bin),
+            dice_i = sklearn.metrics.f1_score(y_true=y_i,
+                                           y_pred=yhat_i_bin),
+        else:
+            precision_i = 0
+            recall_i = 0
+            dice_i = 0
+
+        aupr_i = sklearn.metrics.average_precision_score(y_true=y_i,
+                                                         y_score=yhat_i)
+
+        scores_i = {
+            'Method': method_i,
+            'Precision':precision_i,
+            'Recall': recall_i,
+            'Dice': dice_i,
+            'AUPR': aupr_i
+        }
+        vl_batch_performance.append(scores_i)
+
+il_batch_performance_df = pd.DataFrame(il_batch_performance)
+vl_batch_performance_df = pd.DataFrame(vl_batch_performance)
+
+
+def bs_summary_func(df):
+
+    n = len(df)
+    df_mean = df.mean()
+    df_bs_means = []
+    for i in range(5):
+        df_bs_i = df.sample(n=n, replace=True)
+        df_mean_i = df_bs_i.mean()
+        df_bs_means.append(df_mean_i)
+    df_bs_means = pd.DataFrame(df_bs_means)
+    mu = df_bs_means.mean().round(2).apply(str)
+    ci_lo = df_bs_means.quantile(0.025).round(2).apply(str)
+    ci_hi = df_bs_means.quantile(0.975).round(2).apply(str)
+    out_i =  mu + ' ['+ ci_lo + '-'+ ci_hi + ']'
+
+    return out_i
+
+il_performance = il_batch_performance_df.groupby('Method').agg(bs_summary_func)
+vl_performance = vl_batch_performance_df.groupby('Method').agg(bs_summary_func)
+
+il_performance.to_csv(('tables/il_performance.csv'))
+
+# </editor-fold>
+
+# <editor-fold desc="Visualise Explainability">
+
+random.seed(0)
+np.random.seed(0)
+n_display = 5
+pos_idx = np.where(Z_test)[0]
+np.random.shuffle(pos_idx)
+
+display_idx = pos_idx[:n_display]
+
+x_i = X_test[display_idx]
+y_i = np.squeeze(Y_test[display_idx])
+a_list = np.array([np.squeeze(x_i), y_i])
+yhats_i = compute_yhats(x_i)
+yhats_i = np.stack(list(yhats_i.values()))
+for method_i in range(len(yhats_i)):
+    yhats_ii = yhats_i[method_i]
+    yhats_ii = (yhats_ii - np.min(yhats_ii)) / (np.max(yhats_ii) - np.min(yhats_ii))
+    yhats_i[method_i] = yhats_ii
+a_list = np.concatenate([a_list, yhats_i])
+
+plt.close()
+fig, axs = plt.subplots(n_display, 7)
+
+plt.setp(axs.flat, xticks=[], yticks=[])
+for obs_i in range(n_display):
+    for method_i in range(7):
+
+        axs[obs_i, method_i].imshow(a_list[0][obs_i],
+                                    vmin=-0.6,
+                                    vmax=1.5,
+                                    cmap="gray")
+
+        if method_i > 0:
+            axs[obs_i, method_i].imshow(a_list[method_i][obs_i],
+                                        cmap="jet",
+                                        vmin=0,
+                                        vmax=1,
+                                        alpha=0.5)
+
+for ax, x_label in zip(axs[4], ['Input', 'Ground\nTruth', 'Method\n1', 'Method\n2', 'Method\n3', 'Method\n4',
+                                'Method\n5']):
+    ax.set_xlabel(x_label, size=5)
+
+
+
+plt.imshow(a_list[3][obs_i])
+
+
+
+
+
+
+##################################################
+
+random.seed(0)
+np.random.seed(0)
+n_display = 5
+pos_idx = np.where(Z_test)[0]
+np.random.shuffle(pos_idx)
+display_idx = pos_idx[:n_display]
+
+x_i = X_test[display_idx]
+y_i = np.squeeze(Y_test[display_idx])
+a_list = {'Input': np.squeeze(x_i),
+          'Ground Truth': y_i}
+yhats_i = compute_yhats(x_i)
+for method_i in yhats_i.keys():
+    yhats_ii = yhats_i[method_i]
+    yhats_ii = (yhats_ii-np.min(yhats_ii)) / (np.max(yhats_ii)-np.min(yhats_ii))
+    yhats_i[method_i] = yhats_ii
+a_list.update(yhats_i)
+
+plt.close()
+fig, axs = plt.subplots(5, 7)
+
+plt.setp(axs.flat, xticks=[], yticks=[])
+for obs_i in range(5):
+    for method_i in range(7):
+
+        axs[obs_i, method_i].imshow(a_list['Input'][obs_i],
+                          vmin=0,
+                          vmax=1,
+                          cmap="gray")
+
+        if method_i > 0:
+            axs[obs_i, method_i].imshow(a_list[list(a_list.keys())[method_i]][obs_i],
+                              cmap="jet",
+                              vmin=0,
+                              vmax=1,
+                              alpha=0.5)
+
+for ax, x_label in zip(axs[4], ['Input', 'Ground\nTruth', 'WSUnet', 'GradCAM\n(16,16,64)',
+    'GradCAM\n(8,8,128)', 'Integrated\nGradients', 'Occlusion\nSensitivity']):
+    ax.set_xlabel(x_label, size=5)
+
+if not os.path.exists('figures'):
+    os.mkdir('figures')
+plt.savefig(fname='figures/explainability_vis.png',
+            dpi=600)
+
+# </editor-fold>
+
+# <editor-fold desc="Generate Clinician Review Samples">
+
+if False:
+    random.seed(0)
+    np.random.seed(0)
+    n_display = 5
+    pos_idx = np.where(Z_test)[0]
+    np.random.shuffle(pos_idx)
+
+    method_idx = []
+    if not os.path.exists('figures/clinician_preferences'):
+        os.mkdir('figures/clinician_preferences')
+
+    for set_i in range(1, 21):
+
+        display_idx = pos_idx[(n_display * (set_i - 1)):(n_display * set_i)]
+
+        x_i = X_test[display_idx]
+        y_i = np.squeeze(Y_test[display_idx])
+        a_list = np.array([np.squeeze(x_i), y_i])
+        yhats_i = compute_yhats(x_i)
+        yhats_i = np.stack(list(yhats_i.values()))
+        for method_i in range(len(yhats_i)):
+            yhats_ii = yhats_i[method_i]
+            yhats_ii = (yhats_ii - np.min(yhats_ii)) / (np.max(yhats_ii) - np.min(yhats_ii))
+            yhats_i[method_i] = yhats_ii
+        for obs_i in range(yhats_i.shape[1]):
+            yhats_ii = yhats_i[:, obs_i, :, :]
+            method_idx_i = np.arange(5)
+            np.random.shuffle(method_idx_i)
+            method_idx.append(method_idx_i)
+            yhats_i[:, obs_i, :, :] = yhats_ii[method_idx_i]
+        a_list = np.concatenate([a_list, yhats_i])
+
+        plt.close()
+        fig, axs = plt.subplots(n_display, 7)
+
+        plt.setp(axs.flat, xticks=[], yticks=[])
+        for obs_i in range(n_display):
+            for method_i in range(7):
+
+                axs[obs_i, method_i].imshow(a_list[0][obs_i],
+                                            vmin=-0.6,
+                                            vmax=1.5,
+                                            cmap="gray")
+
+                if method_i > 0:
+                    axs[obs_i, method_i].imshow(a_list[method_i][obs_i],
+                                                cmap="jet",
+                                                vmin=0,
+                                                vmax=1,
+                                                alpha=0.5)
+
+        for ax, x_label in zip(axs[4], ['Input', 'Ground\nTruth', 'Method\n1', 'Method\n2', 'Method\n3', 'Method\n4',
+                                        'Method\n5']):
+            ax.set_xlabel(x_label, size=5)
+
+        test_names = ['Test ' + str(i) for i in np.arange(n_display) + (1 + n_display * (set_i - 1))]
+        for ax, y_label in zip(axs[:, 0], test_names):
+            ax.set_ylabel(y_label, size=5, rotation=0, labelpad=20)
+
+        fig_name = 'figures/clinician_preferences2/clinician_preference_' + \
+                   str(1 + (n_display * (set_i - 1))) + "-" + \
+                   str(n_display * set_i) + '.png'
+        plt.savefig(fname=fig_name,
+                    dpi=300)
+
+    score_sheet = pd.DataFrame({
+        'Test': ['Test ' + str(i) for i in range(1, 101)],
+        'Preferred Method': [''] * 100,
+        'Difficulty': [''] * 100,
+        'Comment': [''] * 100,
+    })
+    score_sheet.to_csv('tables/score_sheet_empty.csv')
+
+    method_idx_df = pd.DataFrame(method_idx)
+    method_idx_df.set_axis(['Test ' + str(i) for i in range(1, 101)], axis=0,
+                           inplace=True)
+    method_idx_df.set_axis(['Method ' + str(i) for i in range(1, 6)], axis=1,
+                           inplace=True)
+    method_idx_df.to_csv('tables/method_idx.csv')
+
+# </editor-fold>
+
+# <editor-fold desc="Analyse Clinician Review Results">
+
+clinician_annotations_dir = r'clinician_annotations_csv/'
+clinician_annotation_files = rec_listdir(clinician_annotations_dir)
+
+clinician_annotation_res = [pd.read_csv(i).iloc[:, :3] for i in clinician_annotation_files]
+for i in range(len(clinician_annotation_res)):
+    clinician_annotation_res[i]['Annotator'] = clinician_annotation_files[i][43:45]
+clinician_annotation_res = pd.concat(clinician_annotation_res)
+
+difficulty_counts = clinician_annotation_res.Difficulty.value_counts()
+difficulty_freq = difficulty_counts/len(clinician_annotation_res)
+preferred_none = clinician_annotation_res['Preferred Method'].value_counts()
+
+method_selections = []
+method_names = [
+    'WSUnet',
+    'GradCAM (16,16,64)',
+    'GradCAM (8,8,128)',
+    'Integrated Gradients',
+    'Occlusion Sensitivity'
+]
+
+if False:
+    method_idx_df = pd.read_csv('tables/method_idx.csv')
+    method_idx = []
+    for i in range(len(method_idx_df)):
+        method_idx.append(method_idx_df.iloc[i, 1:].tolist())
+    for i in method_idx:
+        i.insert(0,0)
+
+for i in range(len(clinician_annotation_res)):
+    test_idx = int(clinician_annotation_res.Test.iloc[i][5:]) - 1
+    selection_i_shuffled = clinician_annotation_res['Preferred Method'].iloc[i] - 1
+    if selection_i_shuffled == -1:
+        method_selections.append('None')
+    else:
+        selection_i = method_idx[test_idx][selection_i_shuffled]
+        method_i = method_names[selection_i]
+        method_selections.append(method_i)
+
+
+
+clinician_annotation_res['Method Selection'] = method_selections
+
+n_test = len(clinician_annotation_res)
+bs_clinician_annotation_res = clinician_annotation_res.sample(n=n_test, replace=True)
+
+method_selection_counts = clinician_annotation_res['Method Selection'].value_counts()
+method_selection_freq = method_selection_counts/len(clinician_annotation_res)
+none_freq = method_selection_freq['None']
+
+clinician_annotation_res = clinician_annotation_res.loc[clinician_annotation_res['Method Selection'] != 'None', :]
+clinician_annotation_res = clinician_annotation_res.reset_index()
+
+n_bs = 500
+n_test = len(clinician_annotation_res)
+bs_method_selection_freq = []
+for i in range(n_bs):
+    freqs_i = clinician_annotation_res.sample(n=n_test, replace=True)['Method Selection'].value_counts(normalize=True)
+    freqs_i = freqs_i.reindex(index=method_names)
+    freqs_i = freqs_i.replace(np.nan, 0)
+    bs_method_selection_freq.append(freqs_i)
+bs_method_selection_freq = pd.DataFrame(bs_method_selection_freq)
+mu = bs_method_selection_freq.mean().round(2).apply(str)
+ci_lo = bs_method_selection_freq.quantile(0.025).round(2).apply(str)
+ci_hi = bs_method_selection_freq.quantile(0.975).round(2).apply(str)
+cp_performance = mu + ' [' + ci_lo + '-' + ci_hi + ']'
+
+cp_performance.to_csv('tables/cp_performance.csv')
+
+
+n_bs = 500
+n_test2 = len(clinician_annotation_res2)
+bs_method_selection_freq = []
+for i in range(n_bs):
+    freqs_i = clinician_annotation_res2.sample(n=n_test2, replace=True)['Method Selection'].value_counts(normalize=True)
+    freqs_i = freqs_i.reindex(index=method_names)
+    freqs_i = freqs_i.replace(np.nan, 0)
+    bs_method_selection_freq.append(freqs_i)
+bs_method_selection_freq = pd.DataFrame(bs_method_selection_freq)
+mu = bs_method_selection_freq.mean().round(2).apply(str)
+ci_lo = bs_method_selection_freq.quantile(0.025).round(2).apply(str)
+ci_hi = bs_method_selection_freq.quantile(0.975).round(2).apply(str)
+cp_performance2 = mu + ' [' + ci_lo + '-' + ci_hi + ']'
+
+cp_performance_all = pd.DataFrame({'total': cp_performance, 'excluding_nones': cp_performance2})
+
+cp_performance_all.to_csv('tables/cp_performance_all.csv')
+
+vl_performance = vl_performance.reindex(index=method_names)
+vl_performance.to_csv('tables/vl_performance.csv')
+
+# </editor-fold>
+
+# <editor-fold desc="Study population characteristics">
+
+# Lung1
+lung1_clinical_metadata = pd.read_csv(base_dir + '/Lung1/clinical_data.csv')
+lung1_clinical_metadata = lung1_clinical_metadata[
+    ['PatientID', 'age', 'gender', 'clinical.T.Stage', 'Clinical.N.Stage',
+     'Clinical.M.Stage',  'Histology',
+     'Survival.time', 'deadstatus.event']]
+lung1_clinical_metadata.columns = ['patient_id', 'age', 'sex', 't_stage', 'n_stage', 'm_stage',
+                                   'histology',  'os_time', 'os_event']
+lung1_clinical_metadata.insert(loc=0, column='institution', value="MUMC")
+lung1_clinical_metadata.insert(loc=0, column='dataset', value="Lung1")
+lung1_image_metadata = pd.read_csv(base_dir + '/Lung1/metadata.csv')[
+    ['Subject ID', 'Study UID', 'Manufacturer', 'Modality']]
+lung1_image_metadata.columns = ['patient_id', 'study_uid', 'manufacturer', 'modality']
+lung1_image_metadata.manufacturer = 'SIEMENS'
+lung1_image_metadata = lung1_image_metadata.loc[lung1_image_metadata.modality == "RTSTRUCT", :]
+lung1_image_metadata = lung1_image_metadata.reset_index().iloc[:, 1:]
+lung1_metadata = pd.merge(lung1_clinical_metadata, lung1_image_metadata, how='left', on='patient_id')
+lung1_metadata.t_stage = lung1_metadata.t_stage.astype(float)
+lung1_metadata.loc[lung1_metadata.t_stage > 4, "t_stage"] = np.nan
+lung1_metadata.n_stage = lung1_metadata.n_stage.astype(float)
+lung1_metadata.loc[lung1_metadata.n_stage > 3, "n_stage"] = np.nan
+lung1_metadata.m_stage = lung1_metadata.m_stage.astype(float)
+lung1_metadata.loc[lung1_metadata.m_stage > 1, "m_stage"] = np.nan
+lung1_metadata.os_time = lung1_metadata.os_time.astype(float)
+lung1_metadata.os_event = lung1_metadata.os_event.astype(float)
+lung1_dir = base_dir + r'\Lung1\NPY\img_windows_' + str(window_size)
+lung1_extracted_files = os.listdir(lung1_dir)
+lung1_extracted_patient_ids = [i[:9] for i in lung1_extracted_files]
+lung1_metadata['segmented_ct_available'] = [i in lung1_extracted_patient_ids for i in lung1_metadata.patient_id]
+lung1_exclusions = sum(~lung1_metadata['segmented_ct_available'])
+
+# Lung2
+lung2_clinical_metadata = pd.read_csv(base_dir + '/Lung2/clinical_data.csv')
+lung2_clinical_metadata = lung2_clinical_metadata[
+    ['Patient affiliation', 'Case ID', 'Age at Histological Diagnosis', 'Gender',
+     'Pathological T stage', 'Pathological N stage',
+     'Pathological M stage',  'Histology ',
+     'Time to Death (days)', 'Survival Status']]
+lung2_clinical_metadata.insert(loc=0, column='dataset', value="Lung2")
+lung2_clinical_metadata.columns = lung1_clinical_metadata.columns
+lung2_image_metadata = pd.read_csv(base_dir + '/Lung2/metadata.csv')[
+    ['Subject ID', 'Study UID', 'Manufacturer',
+     'Modality']]
+lung2_image_metadata.columns = lung1_image_metadata.columns
+lung2_image_metadata.manufacturer.fillna('Unknown')
+for i in pd.unique(lung2_image_metadata.study_uid):
+    manufacturer_i = lung2_image_metadata.manufacturer.loc[
+        (lung2_image_metadata.study_uid == i) &
+        (lung2_image_metadata.modality == 'CT')
+        ].values
+    if len(manufacturer_i) > 0:
+        lung2_image_metadata.manufacturer[lung2_image_metadata.study_uid == i] = manufacturer_i[0]
+lung2_image_metadata = lung2_image_metadata.loc[lung2_image_metadata.modality == "SEG", :]
+lung2_image_metadata = lung2_image_metadata.reset_index().iloc[:, 1:]
+lung2_metadata = pd.merge(lung2_clinical_metadata, lung2_image_metadata, how='left', on='patient_id')
+
+lung2_metadata.age = lung2_metadata.age.astype(float)
+lung2_metadata.t_stage = [i[1] if len(i) > 1 else '' for i in lung2_metadata.t_stage]
+lung2_metadata.t_stage = pd.to_numeric(lung2_metadata.t_stage, errors='coerce')
+lung2_metadata.n_stage = [i[1] if len(i) > 1 else '' for i in lung2_metadata.n_stage]
+lung2_metadata.n_stage = pd.to_numeric(lung2_metadata.n_stage, errors='coerce')
+lung2_metadata.m_stage = [i[1] if len(i) > 1 else '' for i in lung2_metadata.m_stage]
+lung2_metadata.m_stage = pd.to_numeric(lung2_metadata.m_stage, errors='coerce')
+lung2_metadata.os_event = (lung2_metadata.os_event == 'Dead').astype(float)
+lung2_dir = base_dir + r'\Lung2\NPY\img_windows_'+ str(window_size)
+lung2_extracted_files = os.listdir(lung2_dir)
+lung2_extracted_patient_ids = [i[:7] for i in lung2_extracted_files]
+lung2_metadata['segmented_ct_available'] = [i in lung2_extracted_patient_ids for i in lung2_metadata.patient_id]
+lung2_exclusions = sum(~lung2_metadata['segmented_ct_available'])
+
+lung_metadata = pd.merge(lung1_metadata, lung2_metadata, how='outer')
+lung_metadata = lung_metadata.loc[lung_metadata.segmented_ct_available, :]
+lung_metadata = lung_metadata.reset_index().iloc[:, 1:]
+lung_metadata.dataset = ['Aerts' if i == 'Lung1' else 'Bakr' for i in lung_metadata.dataset]
+lung_metadata.age = pd.cut(lung_metadata.age, bins=[20, 40, 60, 80, 100])
+lung_metadata.sex = lung_metadata.sex.str.lower()
+lung_metadata.t_stage = lung_metadata.t_stage.astype(str, errors='ignore').str[0]
+lung_metadata.t_stage = ['Unknown' if i == 'n' else i for i in lung_metadata.t_stage]
+lung_metadata.n_stage = lung_metadata.n_stage.astype(str, errors='ignore').str[0]
+lung_metadata.n_stage = ['Unknown' if i == 'n' else i for i in lung_metadata.n_stage]
+lung_metadata.m_stage = lung_metadata.m_stage.astype(str, errors='ignore').str[0]
+lung_metadata.m_stage = ['Unknown' if i == 'n' else i for i in lung_metadata.m_stage]
+lung_metadata.histology = lung_metadata.histology.str.lower()
+lung_metadata.histology = ['other' if i in ['nos', 'nsclc nos (not otherwise specified)'] else i for i in lung_metadata.histology]
+lung_metadata.os_time = pd.cut(lung_metadata.os_time, bins=[0, 250, 500, 1000,  5000])
+lung_metadata.os_event = ['deceased' if i == 1 else 'survived' for i in lung_metadata.os_event]
+lung_metadata.drop(axis=1, labels=['patient_id', 'study_uid', 'segmented_ct_available', 'modality'], inplace=True)
+
+
+
+
+
+
+
+lung_metadata_counts =[]
+for i in lung_metadata.columns[1:]:
+    lung_metadata_counts.append(pd.DataFrame({
+        'dataset':i,
+        'Aerts': [np.nan],
+        'Bakr': [np.nan]
+    }))
+    df_i = lung_metadata[[i, 'dataset']]
+    counts_i = df_i.pivot_table(index=i,
+                                columns='dataset',
+                                aggfunc=len).fillna(0).astype('int')
+    #counts_i['value'] = counts_i.index.values
+    lung_metadata_counts.append(counts_i)
+lung_metadata_counts = pd.concat(lung_metadata_counts, axis=0)
+lung_metadata_counts.fillna('', inplace=True)
+lung_metadata_counts.reset_index(inplace=True)
+lung_metadata_counts = lung_metadata_counts[['dataset', 'index', 'Aerts', 'Bakr']]
+
+lung_metadata_counts.to_csv('tables/lung_metadata_counts.csv')
+
+# </editor-fold>
+
+# <editor-fold desc="Image Acuisition Parameters">
+
+# lung1
+main_dir = base_dir + r'\Lung1'
+output_dir = main_dir + r'\NPY'
+img_output_dir = output_dir + r'\img_windows_' + str(window_size)
+if not os.path.exists(img_output_dir):
+    os.mkdir(img_output_dir)
+seg_output_dir = output_dir + r'\seg_windows_' + str(window_size)
+if not os.path.exists(seg_output_dir):
+    os.mkdir(seg_output_dir)
+
+all_metadata = pd.read_csv(main_dir + '/metadata.csv')
+img_df = all_metadata.loc[all_metadata.Modality == 'CT', :].reset_index()
+img_df.rename(columns={'File Location': 'img_dir'}, inplace=True)
+seg_df = all_metadata.loc[all_metadata.Modality == 'RTSTRUCT', ['Study UID', 'File Location']]
+seg_df.rename(columns={'File Location': 'seg_dir'}, inplace=True)
+img_metadata = pd.merge(img_df, seg_df, on='Study UID')
+
+lung1_extracted_files_df = pd.DataFrame({
+    'Subject ID': [i[:9] for i in lung1_extracted_files],
+    'Study Date': [i[10:20] for i in lung1_extracted_files],
+})
+lung1_img_metadata = pd.merge(img_metadata, lung1_extracted_files_df)
+lung1_img_metadata['dataset'] = 'Aerts'
+
+# Lung2
+main_dir = base_dir + r'\Lung2'
+output_dir = main_dir + r'\NPY'
+img_output_dir = output_dir + r'\img_windows_' + str(window_size)
+if not os.path.exists(img_output_dir):
+    os.mkdir(img_output_dir)
+seg_output_dir = output_dir + r'\seg_windows_' + str(window_size)
+if not os.path.exists(seg_output_dir):
+    os.mkdir(seg_output_dir)
+
+all_metadata = main_dir + '\metadata.csv'
+all_metadata = pd.read_csv(all_metadata)
+all_metadata = all_metadata[['Subject ID', 'Study UID', 'Study Date', 'Modality', 'File Location']]
+all_metadata = all_metadata.loc[all_metadata['Modality'].isin(('CT', 'SEG')), :]
+all_metadata['Study Date'] = all_metadata['Study Date'].str.replace('/', '-')
+
+img_metadata = all_metadata.loc[all_metadata['Modality'] == 'CT', :]
+img_metadata = img_metadata.drop(labels='Modality', axis=1)
+img_metadata.rename(mapper={'File Location': 'img_dir'}, axis=1, inplace=True)
+seg_metadata = all_metadata.loc[all_metadata['Modality'] == 'SEG', :]
+seg_metadata = seg_metadata.drop(labels='Modality', axis=1)
+seg_metadata.rename(mapper={'File Location': 'seg_dir'}, axis=1, inplace=True)
+img_metadata = img_metadata.merge(seg_metadata, on=['Subject ID', 'Study UID', 'Study Date'])
+lung2_extracted_files_df = pd.DataFrame({
+    'Subject ID': [i[:7] for i in lung2_extracted_files],
+    'Study Date': [i[8:18] for i in lung2_extracted_files],
+})
+lung2_img_metadata = pd.merge(img_metadata, lung2_extracted_files_df)
+lung2_img_metadata['dataset'] = 'Bakr'
+
+lung_img_metadata = pd.merge(lung1_img_metadata[['Subject ID', 'img_dir', 'dataset']],
+                             lung2_img_metadata[['Subject ID', 'img_dir', 'dataset']], how='outer')
+
+def extract_acq_params(img_dir):
+
+    dcm_s1_file = rec_listdir(img_dir)[0]
+    dcm_s1 = pydicom.dcmread(dcm_s1_file, stop_before_pixels=True)
+    scanner_manufacturer = dcm_s1.get([0x0008, 0x0070], "NA")
+    voxel_dim = dcm_s1.get([0x0028, 0x0030], "NA")
+    slice_thickness = dcm_s1.get([0x0018, 0x0050], "NA")
+    kvp = dcm_s1.get([0x0018, 0x0060], "NA")
+    kernel = dcm_s1.get([0x0018, 0x1210], "NA")
+    xr_current = dcm_s1.get([0x0018, 0x1151], "NA")
+    exposure_time = dcm_s1.get([0x0018, 0x1150], "NA")
+    exposure = dcm_s1.get([0x0018, 0x1152], "NA")
+    reconstruction_diameter = dcm_s1.get([0x0018, 0x1100], "NA")
+    acq_params = pd.DataFrame({
+        'scanner_manufacturer': [scanner_manufacturer],
+        'voxel_dim': [voxel_dim[0]],
+        'slice_thickness': [slice_thickness],
+        'kvp': [kvp],
+        'kernel': [kernel],
+        'xr_current': [xr_current],
+        'exposure_time': [exposure_time],
+        'exposure': [exposure],
+        'reconstruction_diameter': [reconstruction_diameter],
+    })
+
+    return acq_params
+
+img_acq_params = []
+for obs_i in range(len(lung_img_metadata)):
+
+    print(obs_i)
+
+    dataset_i = lung_img_metadata.dataset[obs_i]
+    if dataset_i == "Aerts":
+        subdir_i = "Lung1"
+    else:
+        subdir_i = "Lung2"
+    img_dir_i = base_dir + '\\' + subdir_i + lung_img_metadata.img_dir[obs_i][1:]
+    params_i = extract_acq_params(img_dir_i)
+    params_i['dataset'] = dataset_i
+    img_acq_params.append(params_i)
+
+img_acq_params = pd.concat(img_acq_params)
+for column_i in img_acq_params.columns:
+
+    if img_acq_params[column_i].dtype == 'O':
+        values_i = [i.value if type(i) is not str else i for i in img_acq_params[column_i]]
+        img_acq_params[column_i] = values_i
+
+img_acq_params['dataset'] = lung_img_metadata['dataset'].values
+
+
+img_acq_params.fillna(value=np.nan, inplace=True)
+
+img_acq_params.voxel_dim = pd.cut(img_acq_params.voxel_dim, bins=(0.5, 0.75, 0.9, 0.95, 1))
+img_acq_params.slice_thickness = pd.cut(img_acq_params.slice_thickness, bins=(0.625, 1, 2, 3, 5), include_lowest=True)
+img_acq_params.kvp = [i if i not in [None, 'NA'] else 'Unknown' for i in img_acq_params.kvp]
+img_acq_params.kernel = [i if i in ['B19f', 'B30f', 'LUNG', 'STANDARD', 'B31s', 'B31f', 'B18f'] else 'Other' for i in img_acq_params.kernel]
+img_acq_params.xr_current = pd.to_numeric(img_acq_params.xr_current, errors='coerce')
+img_acq_params.xr_current = pd.cut(img_acq_params.xr_current, bins=(25, 100, 250, 750))
+img_acq_params.exposure_time = pd.to_numeric(img_acq_params.exposure_time, errors='coerce')
+img_acq_params.exposure_time = pd.cut(img_acq_params.exposure_time, bins=(300, 400, 750, 1050), include_lowest=True)
+img_acq_params.exposure = pd.to_numeric(img_acq_params.exposure, errors='coerce')
+img_acq_params.exposure = pd.cut(img_acq_params.exposure, bins=(0, 100, 1000, 10000), include_lowest=True)
+img_acq_params.reconstruction_diameter = pd.to_numeric(img_acq_params.reconstruction_diameter, errors='coerce')
+img_acq_params.reconstruction_diameter = pd.cut(img_acq_params.reconstruction_diameter, bins=(300, 400, 450, 500), include_lowest=True)
+
+img_acq_params_counts = []
+for i in img_acq_params.columns[1:-1]:
+    img_acq_params_counts.append(pd.DataFrame({
+        'dataset': i,
+        'Aerts': [np.nan],
+        'Bakr': [np.nan]
+    }))
+    df_i = img_acq_params[[i, 'dataset']]
+    counts_i = df_i.pivot_table(index=i,
+                                columns='dataset',
+                                aggfunc=len).fillna(0).astype('int')
+    # counts_i['value'] = counts_i.index.values
+    img_acq_params_counts.append(counts_i)
+img_acq_params_counts = pd.concat(img_acq_params_counts, axis=0)
+img_acq_params_counts.fillna('', inplace=True)
+img_acq_params_counts.reset_index(inplace=True)
+img_acq_params_counts = img_acq_params_counts[['dataset', 'index', 'Aerts', 'Bakr']]
+img_acq_params_counts.to_csv('tables/img_acq_params_counts.csv')
+
+
+# </editor-fold>
+
+# <editor-fold desc="Study population characteristics 2">
+
+# Lung1
+lung1_clinical_metadata = pd.read_csv(base_dir + '/Lung1/clinical_data.csv')
+lung1_clinical_metadata = lung1_clinical_metadata[
+    ['PatientID', 'age', 'gender', 'clinical.T.Stage', 'Clinical.N.Stage',
+     'Clinical.M.Stage',  'Histology',
+     'Survival.time', 'deadstatus.event']]
+lung1_clinical_metadata.columns = ['patient_id', 'age', 'sex', 't_stage', 'n_stage', 'm_stage',
+                                   'histology',  'os_time', 'os_event']
+lung1_clinical_metadata.insert(loc=0, column='institution', value="MUMC")
+lung1_clinical_metadata.insert(loc=0, column='dataset', value="Lung1")
+lung1_clinical_metadata.n_stage = lung1_clinical_metadata.n_stage.astype(float)
+lung1_clinical_metadata.m_stage = lung1_clinical_metadata.m_stage.astype(float)
+lung1_clinical_metadata.os_time = lung1_clinical_metadata.os_time.astype(float)
+lung1_clinical_metadata.os_event = lung1_clinical_metadata.os_event.astype(float)
+lung1_dir = base_dir + r'\Lung1\NPY\img_windows_' + str(window_size)
+lung1_extracted_files = os.listdir(lung1_dir)
+lung1_extracted_patient_ids = [i[:9] for i in lung1_extracted_files]
+lung1_clinical_metadata['segmented_ct_available'] = [i in lung1_extracted_patient_ids for i in lung1_clinical_metadata.patient_id]
+lung1_exclusions = sum(~lung1_clinical_metadata['segmented_ct_available'])
+
+# Lung2
+lung2_clinical_metadata = pd.read_csv(base_dir + '/Lung2/clinical_data.csv')
+lung2_clinical_metadata = lung2_clinical_metadata[
+    ['Patient affiliation', 'Case ID', 'Age at Histological Diagnosis', 'Gender',
+     'Pathological T stage', 'Pathological N stage',
+     'Pathological M stage',  'Histology ',
+     'Time to Death (days)', 'Survival Status']]
+lung2_clinical_metadata.insert(loc=0, column='dataset', value="Lung2")
+lung2_clinical_metadata.columns = lung1_clinical_metadata.columns[:-1]
+
+lung2_clinical_metadata.age = lung2_clinical_metadata.age.astype(float)
+lung2_clinical_metadata.t_stage = [i[1] if len(i) > 1 else '' for i in lung2_clinical_metadata.t_stage]
+lung2_clinical_metadata.t_stage = pd.to_numeric(lung2_clinical_metadata.t_stage, errors='coerce')
+lung2_clinical_metadata.n_stage = [i[1] if len(i) > 1 else '' for i in lung2_clinical_metadata.n_stage]
+lung2_clinical_metadata.n_stage = pd.to_numeric(lung2_clinical_metadata.n_stage, errors='coerce')
+lung2_clinical_metadata.m_stage = [i[1] if len(i) > 1 else '' for i in lung2_clinical_metadata.m_stage]
+lung2_clinical_metadata.m_stage = pd.to_numeric(lung2_clinical_metadata.m_stage, errors='coerce')
+lung2_clinical_metadata.os_event = (lung2_clinical_metadata.os_event == 'Dead').astype(float)
+lung2_dir = base_dir + r'\Lung2\NPY\img_windows_'+ str(window_size)
+lung2_extracted_files = os.listdir(lung2_dir)
+lung2_extracted_patient_ids = [i[:7] for i in lung2_extracted_files]
+lung2_clinical_metadata['segmented_ct_available'] = [i in lung2_extracted_patient_ids for i in lung2_clinical_metadata.patient_id]
+lung2_exclusions = sum(~lung2_clinical_metadata['segmented_ct_available'])
+
+lung_metadata = pd.merge(lung1_clinical_metadata, lung2_clinical_metadata, how='outer')
+lung_metadata = lung_metadata.loc[lung_metadata.segmented_ct_available, :]
+lung_metadata = lung_metadata.reset_index().iloc[:, 1:]
+lung_metadata.dataset = ['Aerts' if i == 'Lung1' else 'Bakr' for i in lung_metadata.dataset]
+lung_metadata.age = pd.cut(lung_metadata.age, bins=[20, 40, 60, 80, 100])
+lung_metadata.sex = lung_metadata.sex.str.lower()
+lung_metadata.t_stage = lung_metadata.t_stage.astype(str, errors='ignore').str[0]
+lung_metadata.t_stage = ['Unknown' if i == 'n' else i for i in lung_metadata.t_stage]
+lung_metadata.n_stage = lung_metadata.n_stage.astype(str, errors='ignore').str[0]
+lung_metadata.n_stage = ['Unknown' if i == 'n' else i for i in lung_metadata.n_stage]
+lung_metadata.m_stage = lung_metadata.m_stage.astype(str, errors='ignore').str[0]
+lung_metadata.m_stage = ['Unknown' if i == 'n' else i for i in lung_metadata.m_stage]
+lung_metadata.histology = lung_metadata.histology.str.lower()
+lung_metadata.histology = ['other' if i in ['nos', 'nsclc nos (not otherwise specified)'] else i for i in lung_metadata.histology]
+lung_metadata.os_time = pd.cut(lung_metadata.os_time, bins=[0, 250, 500, 1000,  5000])
+lung_metadata.os_event = ['deceased' if i == 1 else 'survived' for i in lung_metadata.os_event]
+lung_metadata.drop(['patient_id', 'segmented_ct_available'], axis=1, inplace=True)
+
+lung_metadata_counts = []
+for i in lung_metadata.columns[1:]:
+    lung_metadata_counts.append(pd.DataFrame({
+        'dataset': i,
+        'Aerts': [np.nan],
+        'Bakr': [np.nan]
+    }))
+    df_i = lung_metadata[[i, 'dataset']]
+    counts_i = df_i.pivot_table(index=i,
+                                columns='dataset',
+                                aggfunc=len).fillna(0).astype('int')
+    # counts_i['value'] = counts_i.index.values
+    lung_metadata_counts.append(counts_i)
+lung_metadata_counts = pd.concat(lung_metadata_counts, axis=0)
+lung_metadata_counts.fillna('', inplace=True)
+lung_metadata_counts.reset_index(inplace=True)
+lung_metadata_counts = lung_metadata_counts[['dataset', 'index', 'Aerts', 'Bakr']]
+lung_metadata_counts.to_csv('tables/lung_metadata_counts.csv')
+
+# </editor-fold>
