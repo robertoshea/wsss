@@ -11,11 +11,14 @@ import rt_utils
 import os
 import random
 import cv2
+
 # </editor-fold>
 
 # <editor-fold desc="Set seed">
 random.seed(0)
 np.random.seed(0)
+
+
 # </editor-fold>
 
 # <editor-fold desc="Utility functions">
@@ -26,41 +29,33 @@ def rec_listdir(dir):
             paths.append(os.path.join(root, filename))
     return paths
 
+
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
+
 
 # </editor-fold>
 
 # <editor-fold desc="Image sampling parameters">
 window_size = 128
 half_window_size = window_size // 2
-n_sample = 16
+n_sample = 40
 class_ratio = 1
-offset = window_size//8
 
-def extract_windows(img_arr, seg_arr):
 
-    # positive windows
+def extract_windows(img_arr, seg_arr, n_sample=n_sample):
+    # select windows
     pos_idx = np.array(np.where(seg_arr)).transpose()
     n_sample_i = min(n_sample, len(pos_idx))
+    neg_idx = pos_idx[np.random.choice(np.arange(len(pos_idx)), size=n_sample_i)]
+    neg_idx[:, 2] = 511 - neg_idx[:, 2]
+    neg_idx = neg_idx + np.random.randint(low=[-15, -75, -75],
+                                          high=[15, 75, 75],
+                                          size=neg_idx.shape)
     pos_idx = pos_idx[np.random.choice(np.arange(len(pos_idx)), size=n_sample_i)]
-    pos_idx[:, 1:] = pos_idx[:, 1:] + np.random.randint(low=-offset,
-                                                        high=offset,
-                                                        size=pos_idx[:, 1:].shape)
-
-    # random windows
-    n_random_sample = n_sample * class_ratio
-    random_idx = np.array([
-        np.random.choice(img_arr.shape[0], size=n_random_sample),
-        np.random.choice(img_arr.shape[1], size=n_random_sample),
-        np.random.choice(img_arr.shape[2], size=n_random_sample)
-    ]).transpose()
-    d1_limits = np.where(np.max(img_arr, axis=(0, 2)) > 0)[0]
-    d2_limits = np.where(np.max(img_arr, axis=(0, 1)) > 0)[0]
-    random_idx[:, 1] = np.clip(random_idx[:, 1], a_max=max(d1_limits)-150, a_min=min(d1_limits)+150)
-    random_idx[:, 2] = np.clip(random_idx[:, 2], a_max=max(d2_limits)-150, a_min=min(d2_limits)+150)
-    centre_idx = np.concatenate([pos_idx, random_idx])
+    centre_idx = np.concatenate([pos_idx, neg_idx])
     centre_idx[:, 1:] = np.clip(centre_idx[:, 1:], a_max=511 - half_window_size, a_min=half_window_size)
+    centre_idx[:, 0] = np.clip(centre_idx[:, 0], a_max=len(img_arr) - 1, a_min=0)
 
     img_windows = []
     seg_windows = []
@@ -84,6 +79,7 @@ def extract_windows(img_arr, seg_arr):
     seg_windows = np.stack(seg_windows).astype('uint8')
 
     return img_windows, seg_windows
+
 
 # </editor-fold>
 
@@ -227,7 +223,7 @@ for obs_i in range(len(img_metadata)):
     img_arr = np.stack([img_arr])
     img_arr = np.squeeze(img_arr)
 
-    img_windows, seg_windows = extract_windows(img_arr, seg_arr)
+    img_windows, seg_windows = extract_windows(img_arr, seg_arr, n_sample=5)
     np.save(arr=img_windows,
             file=img_output_dir + '\\' + patient_id + '_' + date + '.npy')
     np.save(arr=seg_windows,
@@ -247,10 +243,17 @@ import sklearn.metrics
 import random
 import tf_explain
 import cv2
-from scipy import stats
+import gc
+
+
 # </editor-fold>
 
 # <editor-fold desc="Utility Functions">
+def make_newdir(dir):
+    if not os.path.exists(dir):
+        os.mkdir(dir)
+
+
 def rec_listdir(dir):
     paths = list()
     for root, directories, filenames in os.walk(dir):
@@ -261,6 +264,7 @@ def rec_listdir(dir):
 
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
+
 
 def generate_img_df(main_dir):
     # images
@@ -286,13 +290,12 @@ def generate_img_df(main_dir):
 
 
 def load_data(img_df):
-
     # images
     X_i = np.concatenate([np.load(i)
                           for i in img_df.img_file], axis=0)
     X_i = np.expand_dims(X_i, axis=-1)
-    X_i = np.clip(X_i, a_min=-1024, a_max=150)
-    X_i = (X_i + 1024)/1500
+    X_i = np.clip(X_i, a_min=-900, a_max=300)
+    X_i = (X_i + 900) / 1200
 
     # voxel-level labels
     Y_i = np.concatenate([np.load(i)
@@ -304,38 +307,58 @@ def load_data(img_df):
 
     return X_i, Y_i, Z_i
 
+
 def np_dice(y_true, y_pred):
     num = 2. * np.sum(y_true * y_pred)
     denom = np.sum(y_true) + np.sum(y_pred)
     return num / denom
 
-# </editor-fold>
 
-# <editor-fold desc="File Management">
-train_val_dir = 'C:/Users/ro20/Documents/Datasets/Lung1'
-train_val_df = generate_img_df(train_val_dir)
+def bs_summary_func(df):
+    n = len(df)
+    df_bs_means = []
+    for i in range(500):
+        df_bs_i = df.sample(n=n, replace=True)
+        df_mean_i = df_bs_i.mean()
+        df_bs_means.append(df_mean_i)
+    df_bs_means = pd.DataFrame(df_bs_means)
+    mu = df_bs_means.mean().round(2).apply(str)
+    ci_lo = df_bs_means.quantile(0.025).round(2).apply(str)
+    ci_hi = df_bs_means.quantile(0.975).round(2).apply(str)
+    out_i = mu + ' [' + ci_lo + '-' + ci_hi + ']'
 
-train_val_patients = train_val_df.patient_id.unique()
-train_patients = np.random.choice(train_val_patients,
-                                  size=round(len(train_val_patients) * 0.8),
-                                  replace=False)
-val_patients = np.setdiff1d(train_val_patients,
-                            train_patients)
-train_df = train_val_df.loc[train_val_df.patient_id.isin(train_patients), :].reset_index()
-val_df = train_val_df.loc[train_val_df.patient_id.isin(val_patients), :].reset_index()
+    return out_i
 
-test_dir = 'C:/Users/ro20/Documents/Datasets/Lung2'
-test_df = generate_img_df(test_dir)
+
+def ece_func(y_true, y_prob, n_bins=10):
+    y_true = y_true == 1
+    bins = np.linspace(0.0, 1.0, n_bins + 1)
+    binids = np.searchsorted(bins[1:-1], y_prob)
+
+    bin_sums = np.bincount(binids, weights=y_prob, minlength=len(bins))
+    bin_true = np.bincount(binids, weights=y_true, minlength=len(bins))
+    bin_total = np.bincount(binids, minlength=len(bins))
+
+    nonzero = bin_total != 0
+    prob_true = bin_true[nonzero] / bin_total[nonzero]
+    prob_pred = bin_sums[nonzero] / bin_total[nonzero]
+
+    ece_i = np.sum(np.abs(prob_true - prob_pred) * (bin_total[nonzero] / len(y_true)))
+
+    return ece_i
+
 
 # </editor-fold>
 
 # <editor-fold desc="Define Generators">
-BATCH_SIZE = 100
+BATCH_SIZE = 25
 AUG_NOISE = 0.001
 AUG_ROTATE = True
 AUG_VFLIP = True
 AUG_HFLIP = True
-img_size = window_size
+img_size = 128
+window_size = img_size
+
 
 class WeakDataGen(tf.keras.utils.Sequence):
     """Loads batches of dcm files as images for autoencoder"""
@@ -415,6 +438,7 @@ class WeakDataGen(tf.keras.utils.Sequence):
                 x[aug_idx] += np.random.normal(size=(n_aug,) + x.shape[1:], scale=AUG_NOISE)
 
         return x, z
+
 
 class FullDataGen(tf.keras.utils.Sequence):
     """Loads batches of dcm files as images for autoencoder"""
@@ -497,138 +521,28 @@ class FullDataGen(tf.keras.utils.Sequence):
                 x[aug_idx] += np.random.normal(size=(n_aug,) + x.shape[1:], scale=AUG_NOISE)
 
         return x, y
-# </editor-fold>
 
-# <editor-fold desc="Load Training Generators">
-X_train, _, Z_train = load_data(train_df)
-X_val, _, Z_val = load_data(val_df)
-
-ws_train_datagen = WeakDataGen(x=X_train,
-                               z=Z_train,
-                               augment=True,
-                               batch_size=BATCH_SIZE,
-                               shuffle=True)
-
-ws_val_datagen = WeakDataGen(x=X_val,
-                             z=Z_val,
-                             augment=False,
-                             batch_size=BATCH_SIZE,
-                             shuffle=True)
 
 # </editor-fold>
 
-# <editor-fold desc="Loss Functions, Metrics and Callbacks">
+# <editor-fold desc="File Management">
+train_val_dir = 'C:/Users/ro20/Documents/Datasets/Lung1'
+train_val_df = generate_img_df(train_val_dir)
 
-# loss functions
-def bce_loss(y_true, y_pred):
-    bce = tf.keras.losses.binary_crossentropy(y_true=y_true,
-                                              y_pred=y_pred,
-                                              from_logits=True)
-    return bce
+train_val_patients = train_val_df.patient_id.unique()
+train_val_patient_folds = np.random.choice(np.arange(5), size=len(train_val_patients), replace=True)
+test_dir = 'C:/Users/ro20/Documents/Datasets/Lung2'
+test_df = generate_img_df(test_dir)
 
-custom_objects = {
-    'bce_loss': bce_loss
-}
+analysis_date = '06_08_23'
+table_dir = os.path.join('tables', analysis_date)
+make_newdir(table_dir)
 
-# callbacks
-early_stopping_callback = tf.keras.callbacks.EarlyStopping(patience=5)
-model_dir = r'models\20_05_22'
-if not os.path.exists(model_dir):
-    os.mkdir(model_dir)
-ws_model_dir = model_dir + r'\ws_model'
-if not os.path.exists(ws_model_dir):
-    os.mkdir(ws_model_dir)
-standard_model_dir = model_dir + r'\standard_model'
-if not os.path.exists(standard_model_dir):
-    os.mkdir(standard_model_dir)
-
-ws_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(save_best_only=True,
-                                                            filepath=ws_model_dir)
-standard_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(save_best_only=True,
-                                                                  filepath=standard_model_dir)
-
-# </editor-fold>
-
-# <editor-fold desc="Define Models">
-
-# weakly supervised unet
-def define_ws_model(n_filters=8,
-                    n_layers=4,
-                    dropout_rate=0.25):
-    fcn_model = keras_unet.models.custom_unet(input_shape=(img_size, img_size, 1),
-                                              activation='relu',
-                                              use_batch_norm=True,
-                                              upsample_mode='deconv',
-                                              dropout=dropout_rate,
-                                              dropout_type='spatial',
-                                              filters=n_filters,
-                                              num_layers=n_layers,
-                                              output_activation='linear'
-                                              )
-    fcn_model.layers[-1]._name = 'voxel_level_output'
-    image_level_output = tf.keras.layers.GlobalMaxPool2D()(fcn_model.output)
-    ws_model = tf.keras.models.Model(fcn_model.input, image_level_output)
-    ws_model.compile(optimizer='Adam',
-                     loss=bce_loss)
-    return ws_model
-
-#standard model
-def define_standard_model(n_filters=8,
-             n_layers=4,
-             dropout_rate=0.25):
-    inputs = tf.keras.layers.Input(shape=(img_size, img_size, 1))
-    x = inputs
-
-    for layer_i in range(n_layers):
-        x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** layer_i,
-                                   kernel_size=3,
-                                   activation='relu',
-                                   kernel_initializer="he_normal",
-                                   padding='same',
-                                   )(x)
-        x = tf.keras.layers.BatchNormalization()(x)
-        x = tf.keras.layers.SpatialDropout2D(rate=dropout_rate)(x)
-        x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** layer_i,
-                                   kernel_size=3,
-                                   activation='relu',
-                                   kernel_initializer="he_normal",
-                                   padding='same',
-                                   )(x)
-        x = tf.keras.layers.MaxPooling2D(pool_size=2)(x)
-
-    x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** n_layers,
-                               kernel_size=3,
-                               activation='relu',
-                               kernel_initializer="he_normal",
-                               padding='same',
-                               )(x)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.SpatialDropout2D(rate=dropout_rate)(x)
-    x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** n_layers,
-                               kernel_size=3,
-                               activation='relu',
-                               kernel_initializer="he_normal",
-                               padding='same',
-                               )(x)
-
-    x = tf.keras.layers.Flatten()(x)
-    x = tf.keras.layers.Dense(units=128,
-                              activation='relu',
-                              kernel_initializer="he_normal")(x)
-    outputs = tf.keras.layers.Dense(units=1,
-                                    activation='linear')(x)
-
-    model = tf.keras.models.Model(inputs, outputs)
-    model.compile(optimizer='Adam',
-                  loss=bce_loss,
-                  )
-    return model
 
 # </editor-fold>
 
 # <editor-fold desc="Explainability Methods">
 class GradCAM:
-
     """
     Perform Grad CAM algorithm for a given input
     Paper: [Grad-CAM: Visual Explanations from Deep Networks
@@ -636,12 +550,12 @@ class GradCAM:
     """
 
     def explain(
-        self,
-        validation_data,
-        model,
-        class_index,
-        layer_name=None,
-        use_guided_grads=True
+            self,
+            validation_data,
+            model,
+            class_index,
+            layer_name=None,
+            use_guided_grads=True
     ):
         """
         Compute GradCAM for a specific class index.
@@ -707,7 +621,7 @@ class GradCAM:
 
     @staticmethod
     def get_gradients_and_filters(
-        model, images, layer_name, class_index, use_guided_grads
+            model, images, layer_name, class_index, use_guided_grads
     ):
         """
         Generate guided gradients and convolutional outputs with an inference.
@@ -734,9 +648,9 @@ class GradCAM:
 
         if use_guided_grads:
             grads = (
-                tf.cast(conv_outputs > 0, "float32")
-                * tf.cast(grads > 0, "float32")
-                * grads
+                    tf.cast(conv_outputs > 0, "float32")
+                    * tf.cast(grads > 0, "float32")
+                    * grads
             )
 
         return conv_outputs, grads
@@ -784,8 +698,8 @@ class GradCAM:
 
         return cam
 
-class IntegratedGradients:
 
+class IntegratedGradients:
     """
     Perform Integrated Gradients algorithm for a given input
     Paper: [Axiomatic Attribution for Deep Networks](https://arxiv.org/pdf/1703.01365.pdf)
@@ -881,8 +795,8 @@ class IntegratedGradients:
             for index in range(n_steps)
         ]
 
-class OcclusionSensitivity:
 
+class OcclusionSensitivity:
     """
     Perform Occlusion Sensitivity for a given input
     """
@@ -891,11 +805,11 @@ class OcclusionSensitivity:
         self.batch_size = batch_size
 
     def explain(
-        self,
-        validation_data,
-        model,
-        class_index,
-        patch_size,
+            self,
+            validation_data,
+            model,
+            class_index,
+            patch_size,
     ):
         """
         Compute Occlusion Sensitivity maps for a specific class index.
@@ -959,7 +873,7 @@ class OcclusionSensitivity:
         ]
 
         for (index_y, index_x), confidence in zip(
-            coordinates, target_class_predictions
+                coordinates, target_class_predictions
         ):
             sensitivity_map[index_y, index_x] = 1 - confidence
 
@@ -971,185 +885,492 @@ class OcclusionSensitivity:
 grad_cam = GradCAM()
 integrated_gradients = IntegratedGradients()
 occlusion_sensitivity = OcclusionSensitivity()
+
+
 # </editor-fold>
 
-# <editor-fold desc="Fit Models and Save">
-tf.keras.backend.clear_session()
+# <editor-fold desc="Loss Functions">
+
+# loss functions
+def bce_loss(y_true, y_pred):
+    bce = tf.keras.losses.binary_crossentropy(y_true=y_true,
+                                              y_pred=y_pred,
+                                              from_logits=True)
+    return bce
+
+
+custom_objects = {
+    'bce_loss': bce_loss
+}
+
+
+# </editor-fold>
+
+# <editor-fold desc="Define Models">
 
 # weakly supervised unet
-random.seed(0)
-np.random.seed(0)
-ws_model = define_ws_model()
-ws_history = ws_model.fit(x=ws_train_datagen,
-                          validation_data=ws_val_datagen,
-                          epochs=100,
-                          callbacks=[early_stopping_callback,
-                                     ws_checkpoint_callback]
-                          )
+def define_ws_model(n_filters=8,
+                    n_layers=4,
+                    dropout_rate=0.1):
+    fcn_model = keras_unet.models.custom_unet(input_shape=(img_size, img_size, 1),
+                                              activation='relu',
+                                              use_batch_norm=True,
+                                              upsample_mode='deconv',
+                                              dropout=dropout_rate,
+                                              dropout_type='spatial',
+                                              filters=n_filters,
+                                              num_layers=n_layers,
+                                              output_activation='linear'
+                                              )
+    fcn_model.layers[-1]._name = 'voxel_level_output'
+    image_level_output = tf.keras.layers.GlobalMaxPool2D()(fcn_model.output)
+    ws_model = tf.keras.models.Model(fcn_model.input, image_level_output)
+    ws_model.compile(optimizer='Adam',
+                     loss=bce_loss)
+    return ws_model
+
 
 # standard model
-standard_model = define_standard_model()
-standard_history = standard_model.fit(x=ws_train_datagen,
-                                      validation_data=ws_val_datagen,
-                                      epochs=100,
-                                      callbacks=[early_stopping_callback,
-                                                 standard_checkpoint_callback]
-                                      )
+def define_standard_model(n_filters=8,
+                          n_layers=4,
+                          dropout_rate=0.1):
+    inputs = tf.keras.layers.Input(shape=(img_size, img_size, 1))
+    x = inputs
+
+    for layer_i in range(n_layers):
+        x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** layer_i,
+                                   kernel_size=3,
+                                   activation='relu',
+                                   kernel_initializer="he_normal",
+                                   padding='same',
+                                   )(x)
+        x = tf.keras.layers.BatchNormalization()(x)
+        x = tf.keras.layers.SpatialDropout2D(rate=dropout_rate)(x)
+        x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** layer_i,
+                                   kernel_size=3,
+                                   activation='relu',
+                                   kernel_initializer="he_normal",
+                                   padding='same',
+                                   )(x)
+        x = tf.keras.layers.MaxPooling2D(pool_size=2)(x)
+
+    x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** n_layers,
+                               kernel_size=3,
+                               activation='relu',
+                               kernel_initializer="he_normal",
+                               padding='same',
+                               )(x)
+    x = tf.keras.layers.BatchNormalization()(x)
+    x = tf.keras.layers.SpatialDropout2D(rate=dropout_rate)(x)
+    x = tf.keras.layers.Conv2D(filters=n_filters * 2 ** n_layers,
+                               kernel_size=3,
+                               activation='relu',
+                               kernel_initializer="he_normal",
+                               padding='same',
+                               )(x)
+
+    x = tf.keras.layers.Flatten()(x)
+    x = tf.keras.layers.Dense(units=128,
+                              activation='relu',
+                              kernel_initializer="he_normal")(x)
+    outputs = tf.keras.layers.Dense(units=1,
+                                    activation='linear')(x)
+
+    model = tf.keras.models.Model(inputs, outputs)
+    model.compile(optimizer='Adam',
+                  loss=bce_loss,
+                  )
+    return model
+
+
+# Densenet121
+def define_densenet_model():
+    model = tf.keras.applications.densenet.DenseNet121(input_shape=(img_size, img_size, 1),
+                                                       include_top=True,
+                                                       weights=None,
+                                                       pooling='max',
+                                                       classes=1,
+                                                       )
+    model.layers[-1].activation = tf.keras.activations.linear
+    model.compile(optimizer='Adam',
+                  loss=bce_loss,
+                  )
+    return model
+
+
 # </editor-fold>
 
-# <editor-fold desc="Load Models">
-ws_model = tf.keras.models.load_model(ws_model_dir, custom_objects=custom_objects)
-ws_model_voxel_level = tf.keras.models.Model(ws_model.inputs,
-                                             ws_model.get_layer('voxel_level_output').output)
-standard_model = tf.keras.models.load_model(standard_model_dir, custom_objects=custom_objects)
-# </editor-fold>
+# <editor-fold desc="cross validated model training and evaluation">
+for fold_i in range(5):
 
-# <editor-fold desc="Load Testing Generators">
+    # <editor-fold desc="Training Validation split">
+    train_patients = train_val_patients[train_val_patient_folds != fold_i]
+    val_patients = train_val_patients[train_val_patient_folds == fold_i]
+    train_df = train_val_df.loc[train_val_df.patient_id.isin(train_patients), :].reset_index()
+    val_df = train_val_df.loc[train_val_df.patient_id.isin(val_patients), :].reset_index()
+    # </editor-fold>
 
-# unload training data
-del X_train, Z_train, X_val, Z_val
-del ws_train_datagen, ws_val_datagen
+    # <editor-fold desc="Load data">
+    X_train, _, Z_train = load_data(train_df)
+    X_val, Y_val, Z_val = load_data(val_df)
+    # </editor-fold>
 
-random.seed(0)
-np.random.seed(0)
-X_test, Y_test, Z_test = load_data(test_df)
-ws_test_datagen = WeakDataGen(x=X_test,
-                              z=Z_test,
-                              augment=False,
-                              batch_size=25,
-                              shuffle=True)
-fs_test_datagen = FullDataGen(x=X_test,
-                              y=Y_test,
-                              augment=False,
-                              batch_size=25,
-                              shuffle=True)
+    # <editor-fold desc="Load Training Generators">
+    ws_train_datagen = WeakDataGen(x=X_train,
+                                   z=Z_train,
+                                   augment=True,
+                                   batch_size=BATCH_SIZE,
+                                   shuffle=True)
 
-# </editor-fold>
+    ws_val_datagen = WeakDataGen(x=X_val,
+                                 z=Z_val,
+                                 augment=False,
+                                 batch_size=BATCH_SIZE,
+                                 shuffle=True)
 
-# <editor-fold desc="Performance evaluation functions">
+    val_sample_idx = np.random.choice(len(X_val), size=round(len(X_val) * 0.05))
+    fs_val_datagen = FullDataGen(x=X_val[val_sample_idx],
+                                 y=Y_val[val_sample_idx],
+                                 augment=False,
+                                 batch_size=BATCH_SIZE,
+                                 shuffle=True)
 
-# image-level
-def compute_zhats(x):
-    zhat_ws_i = sigmoid(ws_model.predict(x))
-    zhat_standard_i = sigmoid(standard_model.predict(x))
+    # </editor-fold>
 
-    zhats_i = {
-        "WSUnet": zhat_ws_i,
-        "SCNN": zhat_standard_i
-    }
+    # <editor-fold desc="Callbacks">
 
-    return zhats_i
+    # callbacks
+    early_stopping_callback = tf.keras.callbacks.EarlyStopping(patience=5, min_delta=0.005)
+    model_dir = os.path.join('models', analysis_date)
+    if not os.path.exists(model_dir):
+        os.mkdir(model_dir)
+    ws_model_dir = model_dir + r'\ws_model_' + str(fold_i)
+    if not os.path.exists(ws_model_dir):
+        os.mkdir(ws_model_dir)
+    standard_model_dir = model_dir + r'\standard_model_' + str(fold_i)
+    if not os.path.exists(standard_model_dir):
+        os.mkdir(standard_model_dir)
+    densenet_model_dir = model_dir + r'\densenet_model_' + str(fold_i)
+    if not os.path.exists(densenet_model_dir):
+        os.mkdir(densenet_model_dir)
 
-# voxel-level
-gc_layer_idx = [19, 24]
-gc_layer_names = [standard_model.layers[i].name for i in gc_layer_idx]
+    ws_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(save_best_only=True,
+                                                                filepath=ws_model_dir)
+    standard_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(save_best_only=True,
+                                                                      filepath=standard_model_dir)
+    densenet_checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(save_best_only=True,
+                                                                      filepath=densenet_model_dir)
 
-def compute_yhats(x):
-    yhat_ws = sigmoid(np.squeeze(ws_model_voxel_level.predict(x)))
-    yhat_gc_16x16x64 = grad_cam.explain([x, _], model=standard_model, class_index=0, layer_name=gc_layer_names[0])
-    yhat_gc_8x8x128 = grad_cam.explain([x, _], model=standard_model, class_index=0, layer_name=gc_layer_names[1])
-    yhat_ig = integrated_gradients.explain([x, _], model=standard_model, class_index=0)
-    yhat_os = occlusion_sensitivity.explain([x, _], model=standard_model, class_index=0, patch_size=10)
+    # </editor-fold>
 
-    yhats_i = {
-        'WSUnet': yhat_ws,
-        'GradCAM (16,16,64)': yhat_gc_16x16x64,
-        'GradCAM (8,8,128)': yhat_gc_8x8x128,
-        'Integrated Gradients': yhat_ig,
-        'Occlusion Sensitivity': yhat_os
-    }
+    # <editor-fold desc="Fit Models and Save">
 
-    return yhats_i
-# </editor-fold>
+    # weakly supervised unet
+    tf.keras.backend.clear_session()
+    random.seed(0)
+    np.random.seed(0)
+    ws_model = define_ws_model()
+    ws_history = ws_model.fit(x=ws_train_datagen,
+                              validation_data=ws_val_datagen,
+                              epochs=25,
+                              callbacks=[early_stopping_callback,
+                                         ws_checkpoint_callback])
+    pd.DataFrame(ws_history.history).to_csv(os.path.join(ws_model_dir, "history.csv"))
 
-# <editor-fold desc="Evaluate Performance">
+    # standard model
+    tf.keras.backend.clear_session()
+    random.seed(0)
+    np.random.seed(0)
+    standard_model = define_standard_model()
+    standard_history = standard_model.fit(x=ws_train_datagen,
+                                          validation_data=ws_val_datagen,
+                                          epochs=25,
+                                          callbacks=[early_stopping_callback,
+                                                     standard_checkpoint_callback])
+    pd.DataFrame(standard_history.history).to_csv(os.path.join(standard_model_dir, "history.csv"))
 
-il_batch_performance = []
-vl_batch_performance = []
-batch_i = 0
-for x_i, y_i in fs_test_datagen:
+    # densenet model
+    tf.keras.backend.clear_session()
+    random.seed(0)
+    np.random.seed(0)
+    densenet_model = define_densenet_model()
+    densenet_history = densenet_model.fit(x=ws_train_datagen,
+                                          validation_data=ws_val_datagen,
+                                          epochs=25,
+                                          callbacks=[early_stopping_callback,
+                                                     densenet_checkpoint_callback])
+    pd.DataFrame(densenet_history.history).to_csv(os.path.join(densenet_model_dir, "history.csv"))
+    # </editor-fold>
 
-    print(batch_i)
-    batch_i += 1
+    # <editor-fold desc="Load Models">
+    ws_model = tf.keras.models.load_model(ws_model_dir, custom_objects=custom_objects)
+    ws_model_voxel_level = tf.keras.models.Model(ws_model.inputs,
+                                                 ws_model.get_layer('voxel_level_output').output)
+    standard_model = tf.keras.models.load_model(standard_model_dir, custom_objects=custom_objects)
+    densenet_model = tf.keras.models.load_model(densenet_model_dir, custom_objects=custom_objects)
+    # </editor-fold>
 
-    # image-level performance
-    z_i = y_i.max(axis=(1,2,3)).astype(int)
-    zhats_i = compute_zhats(x_i)
-    for method_i in zhats_i.keys():
-        zhat_i = zhats_i.get(method_i)
-        zhat_i_bin = (zhat_i >= 0.5).astype(int)
-        scores_i = {
-            'Method': method_i,
-            'Accuracy': sklearn.metrics.accuracy_score(y_true=z_i,
-                                                       y_pred=zhat_i_bin),
-            'Sensitivity': sklearn.metrics.recall_score(y_true=z_i,
-                                                        y_pred=zhat_i_bin),
-            'Specificity': sklearn.metrics.recall_score(y_true=z_i,
-                                                        y_pred=zhat_i_bin,
-                                                        pos_label=0),
-            'AUC': sklearn.metrics.roc_auc_score(y_true=z_i,
-                                                 y_score=zhat_i),
+    # <editor-fold desc="Performance evaluation functions">
+
+    # image-level
+    def compute_zhats(x):
+        zhat_ws_i = sigmoid(ws_model.predict(x))
+        zhat_standard_i = sigmoid(standard_model.predict(x))
+        zhat_densenet_i = sigmoid(densenet_model.predict(x))
+
+        zhats_i = {
+            "WSUnet": zhat_ws_i,
+            "sCNN": zhat_standard_i,
+            "Densenet": zhat_densenet_i,
         }
-        il_batch_performance.append(scores_i)
 
-    #voxel level performance
-    y_i = y_i.flatten()
-    yhats_i = compute_yhats(x_i)
-    for method_i in yhats_i.keys():
-        yhat_i = yhats_i.get(method_i).flatten()
-        yhat_i_bin = (yhat_i >= 0.5).astype(int)
+        return zhats_i
 
-        if method_i == "WSUnet":
-            precision_i = sklearn.metrics.precision_score(y_true=y_i,
-                                                         y_pred=yhat_i_bin),
-            recall_i = sklearn.metrics.recall_score(y_true=y_i,
-                                                   y_pred=yhat_i_bin),
-            dice_i = sklearn.metrics.f1_score(y_true=y_i,
-                                           y_pred=yhat_i_bin),
-        else:
-            precision_i = 0
-            recall_i = 0
-            dice_i = 0
+    # voxel-level
+    scnn_gc_layer_names = [standard_model.layers[i].name for i in [19, 24]]
+    densenet_gc_layer_names = ['conv3_block12_concat', 'conv4_block24_concat']
 
-        aupr_i = sklearn.metrics.average_precision_score(y_true=y_i,
-                                                         y_score=yhat_i)
 
-        scores_i = {
-            'Method': method_i,
-            'Precision':precision_i,
-            'Recall': recall_i,
-            'Dice': dice_i,
-            'AUPR': aupr_i
+    def compute_yhats(x):
+        yhat_ws = sigmoid(np.squeeze(ws_model_voxel_level.predict(x)))
+        yhat_scnn_gc_16x16x64 = grad_cam.explain([x, _], model=standard_model, class_index=0,
+                                                 layer_name=scnn_gc_layer_names[0])
+        yhat_scnn_gc_8x8x128 = grad_cam.explain([x, _], model=standard_model, class_index=0,
+                                                layer_name=scnn_gc_layer_names[1])
+        yhat_scnn_ig = integrated_gradients.explain([x, _], model=standard_model, class_index=0)
+        yhat_scnn_os = occlusion_sensitivity.explain([x, _], model=standard_model, class_index=0, patch_size=10)
+        yhat_densenet_gc_16x16x64 = grad_cam.explain([x, _], model=densenet_model, class_index=0,
+                                                     layer_name=densenet_gc_layer_names[0])
+        yhat_densenet_gc_8x8x128 = grad_cam.explain([x, _], model=densenet_model, class_index=0,
+                                                    layer_name=densenet_gc_layer_names[1])
+        yhat_densenet_os = occlusion_sensitivity.explain([x, _], model=densenet_model, class_index=0, patch_size=10)
+
+        yhats_i = {
+            'WSUnet': yhat_ws,
+            'sCNN GradCAM (16,16,64)': yhat_scnn_gc_16x16x64,
+            'sCNN GradCAM (8,8,128)': yhat_scnn_gc_8x8x128,
+            'sCNN Integrated Gradients': yhat_scnn_ig,
+            'sCNN Occlusion Sensitivity': yhat_scnn_os,
+            'Densenet GradCAM (16,16,64)': yhat_densenet_gc_16x16x64,
+            'Densenet GradCAM (8,8,128)': yhat_densenet_gc_8x8x128,
+            'Densenet Occlusion Sensitivity': yhat_densenet_os,
         }
-        vl_batch_performance.append(scores_i)
 
-il_batch_performance_df = pd.DataFrame(il_batch_performance)
-vl_batch_performance_df = pd.DataFrame(vl_batch_performance)
+        return yhats_i
+    # </editor-fold>
 
+    # <editor-fold desc="Evaluate Performance Validation">
 
-def bs_summary_func(df):
+    il_batch_performance = []
+    vl_batch_performance = []
+    batch_i = 0
+    for x_i, y_i in fs_val_datagen:
 
-    n = len(df)
-    df_mean = df.mean()
-    df_bs_means = []
-    for i in range(5):
-        df_bs_i = df.sample(n=n, replace=True)
-        df_mean_i = df_bs_i.mean()
-        df_bs_means.append(df_mean_i)
-    df_bs_means = pd.DataFrame(df_bs_means)
-    mu = df_bs_means.mean().round(2).apply(str)
-    ci_lo = df_bs_means.quantile(0.025).round(2).apply(str)
-    ci_hi = df_bs_means.quantile(0.975).round(2).apply(str)
-    out_i =  mu + ' ['+ ci_lo + '-'+ ci_hi + ']'
+        tf.keras.backend.clear_session()
+        print(batch_i)
+        batch_i += 1
 
-    return out_i
+        # image-level performance
+        z_i = y_i.max(axis=(1, 2, 3)).astype(int)
+        if len(np.unique(z_i)) > 1:
 
-il_performance = il_batch_performance_df.groupby('Method').agg(bs_summary_func)
-vl_performance = vl_batch_performance_df.groupby('Method').agg(bs_summary_func)
+            zhats_i = compute_zhats(x_i)
+            for method_i in zhats_i.keys():
+                zhat_i = zhats_i.get(method_i)
+                zhat_i_bin = (zhat_i >= 0.5).astype(int)
+                scores_i = {
+                    'Method': method_i,
+                    'Accuracy': sklearn.metrics.accuracy_score(y_true=z_i,
+                                                               y_pred=zhat_i_bin),
+                    'Sensitivity': sklearn.metrics.recall_score(y_true=z_i,
+                                                                y_pred=zhat_i_bin),
+                    'Specificity': sklearn.metrics.recall_score(y_true=z_i,
+                                                                y_pred=zhat_i_bin,
+                                                                pos_label=0),
+                    'AUC': sklearn.metrics.roc_auc_score(y_true=z_i,
+                                                         y_score=zhat_i),
+                }
+                il_batch_performance.append(scores_i)
 
-il_performance.to_csv(('tables/il_performance.csv'))
+        # voxel level performance
+        y_i = y_i.flatten()
+        yhats_i = compute_yhats(x_i)
+        for method_i in yhats_i.keys():
+            yhat_i = yhats_i.get(method_i).flatten()
+            yhat_i_bin = (yhat_i >= 0.5).astype(int)
+
+            if method_i == "WSUnet":
+                precision_i = sklearn.metrics.precision_score(y_true=y_i,
+                                                              y_pred=yhat_i_bin)
+                recall_i = sklearn.metrics.recall_score(y_true=y_i,
+                                                        y_pred=yhat_i_bin)
+                dice_i = sklearn.metrics.f1_score(y_true=y_i,
+                                                  y_pred=yhat_i_bin)
+                ece_i = ece_func(y_true=y_i, y_prob=yhat_i)
+            else:
+                precision_i = 0
+                recall_i = 0
+                dice_i = 0
+                ece_i = 0
+
+            aupr_i = sklearn.metrics.average_precision_score(y_true=y_i,
+                                                             y_score=yhat_i)
+
+            scores_i = {
+                'Method': method_i,
+                'Precision': precision_i,
+                'Recall': recall_i,
+                'Dice': dice_i,
+                'ECE': ece_i,
+                'AUPR': aupr_i
+            }
+            vl_batch_performance.append(scores_i)
+
+        del x_i, y_i, z_i, yhats_i, yhat_i, yhat_i_bin, zhats_i, zhat_i, zhat_i_bin
+
+    il_batch_performance_df = pd.DataFrame(il_batch_performance)
+    vl_batch_performance_df = pd.DataFrame(vl_batch_performance)
+
+    il_batch_performance_df.to_csv(os.path.join(table_dir, 'il_val_performance_' + str(fold_i) + '_all.csv'))
+    vl_batch_performance_df.to_csv(os.path.join(table_dir, 'vl_val_performance_' + str(fold_i) + '_all.csv'))
+
+    il_performance = il_batch_performance_df.groupby('Method').agg(bs_summary_func)
+    vl_performance = vl_batch_performance_df.groupby('Method').agg(bs_summary_func)
+
+    il_performance.to_csv(os.path.join(table_dir, 'il_val_performance_' + str(fold_i) + '.csv'))
+    vl_performance.to_csv(os.path.join(table_dir, 'vl_val_performance_' + str(fold_i) + '.csv'))
+
+    # unload training and validation data
+    del X_train, Z_train, X_val, Y_val, Z_val
+    del ws_train_datagen, ws_val_datagen, fs_val_datagen
+    # </editor-fold>
+
+    # <editor-fold desc="Evaluate performance Testing">
+    random.seed(0)
+    np.random.seed(0)
+    X_test, Y_test, Z_test = load_data(test_df)
+    ws_test_datagen = WeakDataGen(x=X_test,
+                                  z=Z_test,
+                                  augment=False,
+                                  batch_size=BATCH_SIZE,
+                                  shuffle=True)
+    fs_test_datagen = FullDataGen(x=X_test,
+                                  y=Y_test,
+                                  augment=False,
+                                  batch_size=BATCH_SIZE,
+                                  shuffle=True)
+
+    il_batch_performance = []
+    vl_batch_performance = []
+    batch_i = 0
+    for x_i, y_i in fs_test_datagen:
+
+        tf.keras.backend.clear_session()
+        print(batch_i)
+        batch_i += 1
+
+        # image-level performance
+        z_i = y_i.max(axis=(1, 2, 3)).astype(int)
+        zhats_i = compute_zhats(x_i)
+        for method_i in zhats_i.keys():
+            zhat_i = zhats_i.get(method_i)
+            zhat_i_bin = (zhat_i >= 0.5).astype(int)
+            scores_i = {
+                'Method': method_i,
+                'Accuracy': sklearn.metrics.accuracy_score(y_true=z_i,
+                                                           y_pred=zhat_i_bin),
+                'Sensitivity': sklearn.metrics.recall_score(y_true=z_i,
+                                                            y_pred=zhat_i_bin),
+                'Specificity': sklearn.metrics.recall_score(y_true=z_i,
+                                                            y_pred=zhat_i_bin,
+                                                            pos_label=0),
+                'AUC': sklearn.metrics.roc_auc_score(y_true=z_i,
+                                                     y_score=zhat_i),
+            }
+            il_batch_performance.append(scores_i)
+
+        # voxel level performance
+        y_i = y_i.flatten()
+        yhats_i = compute_yhats(x_i)
+        for method_i in yhats_i.keys():
+            yhat_i = yhats_i.get(method_i).flatten()
+            yhat_i_bin = (yhat_i >= 0.5).astype(int)
+
+            if method_i == "WSUnet":
+                precision_i = sklearn.metrics.precision_score(y_true=y_i,
+                                                              y_pred=yhat_i_bin)
+                recall_i = sklearn.metrics.recall_score(y_true=y_i,
+                                                        y_pred=yhat_i_bin)
+                dice_i = sklearn.metrics.f1_score(y_true=y_i,
+                                                  y_pred=yhat_i_bin)
+                ece_i = ece_func(y_true=y_i, y_prob=yhat_i)
+            else:
+                precision_i = 0
+                recall_i = 0
+                dice_i = 0
+                ece_i = 0
+
+            aupr_i = sklearn.metrics.average_precision_score(y_true=y_i,
+                                                             y_score=yhat_i)
+
+            scores_i = {
+                'Method': method_i,
+                'Precision': precision_i,
+                'Recall': recall_i,
+                'Dice': dice_i,
+                'ECE': ece_i,
+                'AUPR': aupr_i
+            }
+            vl_batch_performance.append(scores_i)
+
+        del z_i, y_i, yhats_i, yhat_i, yhat_i_bin, zhats_i, zhat_i, zhat_i_bin
+
+    il_batch_performance_df = pd.DataFrame(il_batch_performance)
+    vl_batch_performance_df = pd.DataFrame(vl_batch_performance)
+
+    il_batch_performance_df.to_csv(os.path.join(table_dir, 'il_test_performance_' + str(fold_i) + '_all.csv'))
+    vl_batch_performance_df.to_csv(os.path.join(table_dir, 'vl_test_performance_' + str(fold_i) + '_all.csv'))
+
+    il_performance = il_batch_performance_df.groupby('Method').agg(bs_summary_func)
+    vl_performance = vl_batch_performance_df.groupby('Method').agg(bs_summary_func)
+
+    il_performance.to_csv(os.path.join(table_dir, 'il_test_performance_' + str(fold_i) + '.csv'))
+    vl_performance.to_csv(os.path.join(table_dir, 'vl_test_performance_' + str(fold_i) + '.csv'))
+
+    # unload test data
+    del X_test, Y_test, Z_test
+    del fs_test_datagen, ws_test_datagen
+    del ws_model, ws_model_voxel_level, standard_model, densenet_model
+
+    # </editor-fold>
+# </editor-fold>
+
+# <editor-fold desc="Aggregate performance scores">
+
+all_il_performance = []
+all_vl_performance = []
+
+for fold_i in range(5):
+    for partition in ['test', 'val']:
+        for eval_type in ['il', 'vl']:
+            file_i = os.path.join(table_dir, eval_type + '_' + partition + '_performance_' + str(fold_i) + '_all.csv')
+            df_i = pd.read_csv(file_i, index_col=1)
+            df_i['Partition'] = partition
+            if eval_type == 'il':
+                all_il_performance.append(df_i)
+            else:
+                all_vl_performance.append(df_i)
+
+all_il_performance = pd.concat(all_il_performance, axis=0)
+all_vl_performance = pd.concat(all_vl_performance, axis=0)
+
+all_il_performance_summary = all_il_performance.groupby(['Partition', 'Method']).agg(bs_summary_func)
+all_vl_performance_summary = all_vl_performance.groupby(['Partition', 'Method']).agg(bs_summary_func)
+all_il_performance_summary.to_csv(os.path.join(table_dir, 'all_folds_il_performance_summary.csv'))
+all_vl_performance_summary.to_csv(os.path.join(table_dir, 'all_folds_vl_performance_summary.csv'))
 
 # </editor-fold>
+
 
 # <editor-fold desc="Visualise Explainability">
 
@@ -1195,14 +1416,7 @@ for ax, x_label in zip(axs[4], ['Input', 'Ground\nTruth', 'Method\n1', 'Method\n
                                 'Method\n5']):
     ax.set_xlabel(x_label, size=5)
 
-
-
 plt.imshow(a_list[3][obs_i])
-
-
-
-
-
 
 ##################################################
 
@@ -1220,7 +1434,7 @@ a_list = {'Input': np.squeeze(x_i),
 yhats_i = compute_yhats(x_i)
 for method_i in yhats_i.keys():
     yhats_ii = yhats_i[method_i]
-    yhats_ii = (yhats_ii-np.min(yhats_ii)) / (np.max(yhats_ii)-np.min(yhats_ii))
+    yhats_ii = (yhats_ii - np.min(yhats_ii)) / (np.max(yhats_ii) - np.min(yhats_ii))
     yhats_i[method_i] = yhats_ii
 a_list.update(yhats_i)
 
@@ -1232,24 +1446,24 @@ for obs_i in range(5):
     for method_i in range(7):
 
         axs[obs_i, method_i].imshow(a_list['Input'][obs_i],
-                          vmin=0,
-                          vmax=1,
-                          cmap="gray")
+                                    vmin=0,
+                                    vmax=1,
+                                    cmap="gray")
 
         if method_i > 0:
             axs[obs_i, method_i].imshow(a_list[list(a_list.keys())[method_i]][obs_i],
-                              cmap="jet",
-                              vmin=0,
-                              vmax=1,
-                              alpha=0.5)
+                                        cmap="jet",
+                                        vmin=0,
+                                        vmax=1,
+                                        alpha=0.5)
 
 for ax, x_label in zip(axs[4], ['Input', 'Ground\nTruth', 'WSUnet', 'GradCAM\n(16,16,64)',
-    'GradCAM\n(8,8,128)', 'Integrated\nGradients', 'Occlusion\nSensitivity']):
+                                'GradCAM\n(8,8,128)', 'Integrated\nGradients', 'Occlusion\nSensitivity']):
     ax.set_xlabel(x_label, size=5)
 
 if not os.path.exists('figures'):
     os.mkdir('figures')
-plt.savefig(fname='figures/explainability_vis.png',
+plt.savefig(fname='figures/explainability_vis_09_08_23.png',
             dpi=600)
 
 # </editor-fold>
