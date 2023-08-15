@@ -526,12 +526,12 @@ class FullDataGen(tf.keras.utils.Sequence):
 # </editor-fold>
 
 # <editor-fold desc="File Management">
-train_val_dir = 'C:/Users/ro20/Documents/Datasets/Lung1'
+train_val_dir = '[path to directory]/Datasets/Lung1'
 train_val_df = generate_img_df(train_val_dir)
 
 train_val_patients = train_val_df.patient_id.unique()
 train_val_patient_folds = np.random.choice(np.arange(5), size=len(train_val_patients), replace=True)
-test_dir = 'C:/Users/ro20/Documents/Datasets/Lung2'
+test_dir = '[path to directory]/Datasets/Lung2'
 test_df = generate_img_df(test_dir)
 
 analysis_date = '06_08_23'
