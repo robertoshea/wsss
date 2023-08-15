@@ -84,7 +84,7 @@ def extract_windows(img_arr, seg_arr, n_sample=n_sample):
 # </editor-fold>
 
 # <editor-fold desc="Set base directory">
-base_dir = r'C:\Users\ro20\Documents\Datasets'
+base_dir = r'[path to directory]\Datasets'
 # </editor-fold>
 
 # Lung1 (download from https://wiki.cancerimagingarchive.net/display/Public/NSCLC-Radiomics)
