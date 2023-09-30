@@ -1372,6 +1372,143 @@ all_vl_performance_summary.to_csv(os.path.join(table_dir, 'all_folds_vl_performa
 # </editor-fold>
 
 
+# <editor-fold desc="WSUnet training progress">
+for fold_i in range(5):
+
+    # <editor-fold desc="Training Validation split">
+    train_patients = train_val_patients[train_val_patient_folds != fold_i]
+    val_patients = train_val_patients[train_val_patient_folds == fold_i]
+    train_df = train_val_df.loc[train_val_df.patient_id.isin(train_patients), :].reset_index()
+    val_df = train_val_df.loc[train_val_df.patient_id.isin(val_patients), :].reset_index()
+    # </editor-fold>
+
+    # <editor-fold desc="Load data">
+    X_train, _, Z_train = load_data(train_df)
+    X_val, Y_val, Z_val = load_data(val_df)
+    # </editor-fold>
+
+    # <editor-fold desc="Load Training Generators">
+    ws_train_datagen = WeakDataGen(x=X_train,
+                                   z=Z_train,
+                                   augment=True,
+                                   batch_size=BATCH_SIZE,
+                                   shuffle=True)
+
+    ws_val_datagen = WeakDataGen(x=X_val,
+                                 z=Z_val,
+                                 augment=False,
+                                 batch_size=BATCH_SIZE,
+                                 shuffle=True)
+
+    val_sample_idx = np.random.choice(len(X_val), size=round(len(X_val) * 0.05))
+    fs_val_datagen = FullDataGen(x=X_val[val_sample_idx],
+                                 y=Y_val[val_sample_idx],
+                                 augment=False,
+                                 batch_size=BATCH_SIZE,
+                                 shuffle=True)
+
+    # </editor-fold>
+
+    # <editor-fold desc="Fit Model">
+
+    # weakly supervised unet
+    tf.keras.backend.clear_session()
+    random.seed(0)
+    np.random.seed(0)
+    epoch_i = 0
+    ws_model = define_ws_model()
+    il_performance_history = []
+    vl_performance_history = []
+    for epoch_i in range(25):
+        ws_model_history = ws_model.fit(x=ws_train_datagen,
+                                        validation_data=ws_val_datagen,
+                                        epochs=1)
+        ws_model_voxel_level = tf.keras.models.Model(ws_model.inputs,
+                                                     ws_model.get_layer('voxel_level_output').output)
+        # </editor-fold>
+
+        # <editor-fold desc="Performance evaluation functions">
+
+        # image-level
+        def compute_zhats(x):
+            zhat_ws_i = sigmoid(ws_model.predict(x))
+            zhats_i = {
+                "WSUnet": zhat_ws_i,
+            }
+
+            return zhats_i
+
+        # voxel-level
+        def compute_yhats(x):
+            yhat_ws = sigmoid(np.squeeze(ws_model_voxel_level.predict(x)))
+            yhats_i = {
+                'WSUnet': yhat_ws
+            }
+
+            return yhats_i
+        # </editor-fold>
+
+    # <editor-fold desc="Evaluate Performance Validation">
+
+        il_batch_performance = []
+        vl_batch_performance = []
+        batch_i = 0
+        for x_i, y_i in fs_val_datagen:
+
+            tf.keras.backend.clear_session()
+            print(batch_i)
+            batch_i += 1
+
+            # image-level performance
+            il_performance = ws_model_history.history
+
+            # voxel level performance
+            y_i = y_i.flatten()
+            yhats_i = compute_yhats(x_i)
+            for method_i in yhats_i.keys():
+                yhat_i = yhats_i.get(method_i).flatten()
+                yhat_i_bin = (yhat_i >= 0.5).astype(int)
+
+                precision_i = sklearn.metrics.precision_score(y_true=y_i,
+                                                              y_pred=yhat_i_bin)
+                recall_i = sklearn.metrics.recall_score(y_true=y_i,
+                                                        y_pred=yhat_i_bin)
+                dice_i = sklearn.metrics.f1_score(y_true=y_i,
+                                                  y_pred=yhat_i_bin)
+
+                scores_i = {
+                    'Precision': precision_i,
+                    'Recall': recall_i,
+                    'Dice': dice_i
+                }
+                vl_batch_performance.append(scores_i)
+
+            del x_i, y_i, yhats_i, yhat_i, yhat_i_bin
+
+        vl_performance = pd.DataFrame(vl_batch_performance).mean()
+
+        il_performance['epoch'] = epoch_i
+        vl_performance['epoch'] = epoch_i
+
+        il_performance_history.append(il_performance)
+        vl_performance_history.append(vl_performance)
+        gc.collect()
+
+    il_performance_history = pd.DataFrame(il_performance_history)
+    vl_performance_history = pd.DataFrame(vl_performance_history)
+    il_performance_history['fold'] = fold_i
+    vl_performance_history['fold'] = fold_i
+    il_performance_history.to_csv(os.path.join(table_dir, 'il_performance_history_wsunet_' + str(fold_i) + '.csv'))
+    vl_performance_history.to_csv(os.path.join(table_dir, 'vl_performance_history_wsunet_' + str(fold_i) + '.csv'))
+
+    # unload training and validation data
+    del X_train, Z_train, X_val, Y_val, Z_val
+    del ws_train_datagen, ws_val_datagen, fs_val_datagen
+    # </editor-fold>
+
+# </editor-fold>
+
+
 # <editor-fold desc="Visualise Explainability">
 
 random.seed(0)
